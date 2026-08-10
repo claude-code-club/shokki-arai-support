@@ -1,5 +1,8 @@
 """月ごとのジグソーパズル用イラスト（自前SVG、外部画像なし）。"""
 
+import math
+import random
+
 _VIEWBOX = "0 0 700 500"
 
 
@@ -8,6 +11,35 @@ def _wrap(body, bg="#dff0f7"):
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{_VIEWBOX}">'
         f'<rect width="700" height="500" fill="{bg}"/>{body}</svg>'
     )
+
+
+# 山下清の花火の絵を意識した、ちぎり絵風の色とりどりの点々で描く花火バースト。
+# 直線のスパークではなく、大小の丸をびっしり敷き詰めて塊としての花火にする。
+_FIREWORK_PALETTE = [
+    "#ff3b3b", "#ff7a1a", "#ffcc33", "#ff4fa3", "#e63aa8",
+    "#3aa0ff", "#38d6c0", "#7a5cff", "#ffffff", "#ffe066",
+]
+
+
+def _firework_burst(cx, cy, max_r, density, rng):
+    dots = []
+    n_rings = 9
+    for ring in range(n_rings):
+        ratio = (ring + 1) / n_rings
+        ring_r = max_r * ratio
+        count = max(6, int(density * ratio))
+        for i in range(count):
+            angle = (2 * math.pi * i / count) + rng.uniform(-0.18, 0.18)
+            r = ring_r + rng.uniform(-max_r * 0.05, max_r * 0.05)
+            x = cx + r * math.cos(angle)
+            y = cy + r * math.sin(angle)
+            size = max(2.0, (1 - ratio) * 10 + rng.uniform(0.5, 2.5))
+            color = rng.choice(_FIREWORK_PALETTE)
+            op = round(rng.uniform(0.75, 1.0), 2)
+            dots.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{size:.1f}" fill="{color}" opacity="{op}"/>')
+    # 中心の白い閃光
+    dots.append(f'<circle cx="{cx}" cy="{cy}" r="{max_r*0.12:.1f}" fill="#fff6d8" opacity="0.9"/>')
+    return "".join(dots)
 
 
 MONTH_SVGS = {
@@ -79,20 +111,17 @@ MONTH_SVGS = {
         '<polygon points="150,80 158,100 178,100 162,112 168,132 150,120 132,132 138,112 122,100 142,100" fill="#f4d35e"/>',
         bg="#1e2a55",
     ),
-    8: _wrap(  # 花火
-        '<g stroke="#ffd166" stroke-width="3">'
-        '<line x1="200" y1="150" x2="200" y2="90"/><line x1="200" y1="150" x2="245" y2="105"/>'
-        '<line x1="200" y1="150" x2="260" y2="150"/><line x1="200" y1="150" x2="245" y2="195"/>'
-        '<line x1="200" y1="150" x2="200" y2="210"/><line x1="200" y1="150" x2="155" y2="195"/>'
-        '<line x1="200" y1="150" x2="140" y2="150"/><line x1="200" y1="150" x2="155" y2="105"/>'
-        '</g>'
-        '<g stroke="#ef476f" stroke-width="3">'
-        '<line x1="500" y1="230" x2="500" y2="170"/><line x1="500" y1="230" x2="545" y2="185"/>'
-        '<line x1="500" y1="230" x2="560" y2="230"/><line x1="500" y1="230" x2="545" y2="275"/>'
-        '<line x1="500" y1="230" x2="500" y2="290"/><line x1="500" y1="230" x2="455" y2="275"/>'
-        '<line x1="500" y1="230" x2="440" y2="230"/><line x1="500" y1="230" x2="455" y2="185"/>'
-        '</g>'
-        '<rect x="0" y="420" width="700" height="80" fill="#274a6b"/>',
+    8: _wrap(  # 花火（山下清の花火の絵を意識した、色とりどりの点描バースト）
+        (lambda rng: (
+            _firework_burst(190, 160, 150, 130, rng)
+            + _firework_burst(480, 130, 130, 110, rng)
+            + _firework_burst(360, 260, 105, 90, rng)
+            + _firework_burst(80, 300, 70, 55, rng)
+            + _firework_burst(610, 300, 75, 55, rng)
+            + '<rect x="0" y="430" width="700" height="70" fill="#0a1024"/>'
+            + '<polygon points="0,430 40,430 40,395 70,395 70,430 120,430 120,410 160,410 160,430 '
+            '700,430 700,500 0,500" fill="#0a1024"/>'
+        ))(random.Random(20260808)),
         bg="#0c1b3a",
     ),
     9: _wrap(  # お月見
