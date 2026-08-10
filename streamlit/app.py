@@ -1,7 +1,7 @@
 import base64
 import calendar
 import json
-from datetime import date, timedelta
+from datetime import date, timedelta, timezone, datetime
 from pathlib import Path
 
 import requests
@@ -11,6 +11,13 @@ from encourage import get_encouragement
 from illustrations import get_month_svg
 
 DATA_FILE = Path(__file__).parent / "data" / "records.json"
+JST = timezone(timedelta(hours=9))
+
+
+def today_jst():
+    # Streamlit Community Cloud等、サーバーがUTCで動く環境でも
+    # 日本時間の「今日」がずれないようにする
+    return datetime.now(JST).date()
 
 # 東京の座標。Open-Meteo は無料・APIキー不要の天気API。
 WEATHER_API_URL = "https://api.open-meteo.com/v1/forecast"
@@ -66,7 +73,7 @@ def save_dates(dates):
 
 def calc_current_streak(dates):
     streak = 0
-    day = date.today()
+    day = today_jst()
     while day.isoformat() in dates:
         streak += 1
         day -= timedelta(days=1)
@@ -127,7 +134,7 @@ except (requests.RequestException, KeyError, ValueError):
     st.caption("（今日の天気は取得できませんでした）")
 
 dates = load_dates()
-today_str = date.today().isoformat()
+today_str = today_jst().isoformat()
 
 @st.cache_data(ttl=3600)
 def cached_encouragement(streak, best_streak, day_key):
@@ -160,7 +167,7 @@ col2.metric("最長記録", f"{calc_best_streak(dates)} 日")
 
 st.divider()
 
-today = date.today()
+today = today_jst()
 days_in_month, filled_days = build_month_progress(dates, today.year, today.month)
 _, month_label = MONTH_THEME.get(today.month, ("", ""))
 st.subheader(f"今月のジグソーパズル（{today.month}月・{month_label}）")
