@@ -224,3 +224,4 @@ else:
     st.write("　".join(recent))
 
 st.caption(f"累計記録日数: {len(dates)}日")
+st.caption("v1.0")
