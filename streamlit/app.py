@@ -123,7 +123,7 @@ def build_month_progress(dates, year, month):
 st.set_page_config(page_title="食器洗いサポート", page_icon="🍽️")
 
 st.title("🍽️ 食器洗いサポート")
-st.caption("洗った日を記録して、毎日の頑張りを見える化しよう")
+st.caption("食器洗いを記録して、毎日の頑張りと小さな達成感を見える化しよう")
 
 try:
     weather = fetch_weather()
