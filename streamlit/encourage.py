@@ -1,6 +1,7 @@
 """Claude APIで、記録を続けている本人への一言コメントを生成する（第21課題）。"""
 
 import os
+import sys
 
 import anthropic
 
@@ -17,7 +18,7 @@ def get_encouragement(streak, best_streak):
     try:
         client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
-            model="claude-haiku-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=60,
             messages=[
                 {
@@ -32,6 +33,8 @@ def get_encouragement(streak, best_streak):
             ],
         )
         return message.content[0].text.strip()
-    except Exception:
-        # 外部APIの失敗理由を問わず、ここで必ず吸収してアプリを落とさない
+    except Exception as e:
+        # 外部APIの失敗理由を問わず、ここで必ず吸収してアプリを落とさない。
+        # ただし原因が分かるよう、標準エラー出力（ホスティング先のログ）には残す。
+        print(f"[encourage] Claude API呼び出し失敗: {e}", file=sys.stderr)
         return None
