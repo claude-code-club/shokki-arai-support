@@ -21,24 +21,30 @@ _FIREWORK_PALETTE = [
 ]
 
 
-def _firework_burst(cx, cy, max_r, density, rng):
+def _firework_burst(cx, cy, max_r, n_sparks, rng):
+    # 花火＝中心から放射状に飛び散る「光の筋」の集合。同心円の点描だと菊の花に見えてしまうため、
+    # 各スパークを中心から外へ伸びる筋（先端ほど明るく太い）として描く。
     dots = []
-    n_rings = 9
-    for ring in range(n_rings):
-        ratio = (ring + 1) / n_rings
-        ring_r = max_r * ratio
-        count = max(6, int(density * ratio))
-        for i in range(count):
-            angle = (2 * math.pi * i / count) + rng.uniform(-0.18, 0.18)
-            r = ring_r + rng.uniform(-max_r * 0.05, max_r * 0.05)
-            x = cx + r * math.cos(angle)
-            y = cy + r * math.sin(angle)
-            size = max(2.0, (1 - ratio) * 10 + rng.uniform(0.5, 2.5))
-            color = rng.choice(_FIREWORK_PALETTE)
-            op = round(rng.uniform(0.75, 1.0), 2)
+    for i in range(n_sparks):
+        angle = (2 * math.pi * i / n_sparks) + rng.uniform(-0.06, 0.06)
+        length = max_r * rng.uniform(0.65, 1.15)
+        dx, dy = math.cos(angle), math.sin(angle)
+        droop = rng.uniform(0.0, 0.18) * max(0.0, dy)  # 下向きのスパークはわずかに垂れる（尺玉らしさ）
+        color = rng.choice(_FIREWORK_PALETTE)
+        n_dots = max(5, int(length / 7))
+        for j in range(1, n_dots + 1):
+            t = j / n_dots
+            r = length * t
+            x = cx + dx * r
+            y = cy + dy * r + droop * (t ** 2) * max_r * 0.4
+            size = max(1.0, 3.6 * (1 - t) + 0.6)
+            op = round(0.3 + 0.7 * (1 - t), 2)
             dots.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{size:.1f}" fill="{color}" opacity="{op}"/>')
+        tip_x = cx + dx * length
+        tip_y = cy + dy * length + droop * max_r * 0.4
+        dots.append(f'<circle cx="{tip_x:.1f}" cy="{tip_y:.1f}" r="2.4" fill="#fff6d8" opacity="0.95"/>')
     # 中心の白い閃光
-    dots.append(f'<circle cx="{cx}" cy="{cy}" r="{max_r*0.12:.1f}" fill="#fff6d8" opacity="0.9"/>')
+    dots.append(f'<circle cx="{cx}" cy="{cy}" r="{max_r*0.09:.1f}" fill="#fff6d8" opacity="0.9"/>')
     return "".join(dots)
 
 
@@ -113,11 +119,11 @@ MONTH_SVGS = {
     ),
     8: _wrap(  # 花火（山下清の花火の絵を意識した、色とりどりの点描バースト）
         (lambda rng: (
-            _firework_burst(190, 160, 150, 130, rng)
-            + _firework_burst(480, 130, 130, 110, rng)
-            + _firework_burst(360, 260, 105, 90, rng)
-            + _firework_burst(80, 300, 70, 55, rng)
-            + _firework_burst(610, 300, 75, 55, rng)
+            _firework_burst(190, 160, 150, 46, rng)
+            + _firework_burst(480, 130, 130, 40, rng)
+            + _firework_burst(360, 260, 105, 34, rng)
+            + _firework_burst(80, 300, 70, 22, rng)
+            + _firework_burst(610, 300, 75, 22, rng)
             + '<rect x="0" y="430" width="700" height="70" fill="#0a1024"/>'
             + '<polygon points="0,430 40,430 40,395 70,395 70,430 120,430 120,410 160,410 160,430 '
             '700,430 700,500 0,500" fill="#0a1024"/>'
