@@ -13,39 +13,72 @@ def _wrap(body, bg="#dff0f7"):
     )
 
 
-# 山下清の花火の絵を意識した、ちぎり絵風の色とりどりの点々で描く花火バースト。
-# 直線のスパークではなく、大小の丸をびっしり敷き詰めて塊としての花火にする。
-_FIREWORK_PALETTE = [
-    "#ff3b3b", "#ff7a1a", "#ffcc33", "#ff4fa3", "#e63aa8",
-    "#3aa0ff", "#38d6c0", "#7a5cff", "#ffffff", "#ffe066",
-]
+# 山下清の花火の絵を意識した、素朴で幾何学的なスタイル。
+# 写真のような不揃いな光跡ではなく、正円に近い輪郭・まっすぐな放射スパーク・ベタ塗りの2色構成で描く。
+_FIREWORK_PALETTES = {
+    "gold": ("#ffcc33", "#ffe066"),
+    "pink": ("#ff4fa3", "#ffffff"),
+    "blue": ("#3aa0ff", "#ffffff"),
+    "red": ("#ff3b3b", "#ffcc33"),
+    "purple": ("#7a5cff", "#3aa0ff"),
+}
 
 
-def _firework_burst(cx, cy, max_r, n_sparks, rng):
-    # 花火＝中心から放射状に飛び散る「光の筋」の集合。同心円の点描だと菊の花に見えてしまうため、
-    # 各スパークを中心から外へ伸びる筋（先端ほど明るく太い）として描く。
-    dots = []
+def _firework_burst(cx, cy, r, n_sparks, palette, rng):
+    main_color, center_color = _FIREWORK_PALETTES[palette]
+    parts = []
+    # まっすぐなスパークで正円の輪郭を作る（山下清の花火絵の特徴）
     for i in range(n_sparks):
-        angle = (2 * math.pi * i / n_sparks) + rng.uniform(-0.06, 0.06)
-        length = max_r * rng.uniform(0.65, 1.15)
-        dx, dy = math.cos(angle), math.sin(angle)
-        droop = rng.uniform(0.0, 0.18) * max(0.0, dy)  # 下向きのスパークはわずかに垂れる（尺玉らしさ）
-        color = rng.choice(_FIREWORK_PALETTE)
-        n_dots = max(5, int(length / 7))
-        for j in range(1, n_dots + 1):
-            t = j / n_dots
-            r = length * t
-            x = cx + dx * r
-            y = cy + dy * r + droop * (t ** 2) * max_r * 0.4
-            size = max(1.0, 3.6 * (1 - t) + 0.6)
-            op = round(0.3 + 0.7 * (1 - t), 2)
-            dots.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{size:.1f}" fill="{color}" opacity="{op}"/>')
-        tip_x = cx + dx * length
-        tip_y = cy + dy * length + droop * max_r * 0.4
-        dots.append(f'<circle cx="{tip_x:.1f}" cy="{tip_y:.1f}" r="2.4" fill="#fff6d8" opacity="0.95"/>')
-    # 中心の白い閃光
-    dots.append(f'<circle cx="{cx}" cy="{cy}" r="{max_r*0.09:.1f}" fill="#fff6d8" opacity="0.9"/>')
-    return "".join(dots)
+        angle = 2 * math.pi * i / n_sparks
+        spark_r = r * rng.uniform(0.94, 1.0)
+        x = cx + spark_r * math.cos(angle)
+        y = cy + spark_r * math.sin(angle)
+        width = rng.uniform(1.1, 1.7)
+        parts.append(f'<line x1="{cx:.1f}" y1="{cy:.1f}" x2="{x:.1f}" y2="{y:.1f}" stroke="{main_color}" stroke-width="{width:.1f}" opacity="0.92"/>')
+        parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{rng.uniform(1.6,2.4):.1f}" fill="{main_color}" opacity="0.95"/>')
+    # フチを縁取る点線の輪（散った火花のふちどり）
+    n_ring = int(n_sparks * 1.4)
+    for i in range(n_ring):
+        angle = 2 * math.pi * i / n_ring
+        rr = r * rng.uniform(1.0, 1.06)
+        x = cx + rr * math.cos(angle)
+        y = cy + rr * math.sin(angle)
+        parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="1.1" fill="{main_color}" opacity="0.6"/>')
+    # 中心の明るい光
+    parts.append(f'<circle cx="{cx}" cy="{cy}" r="{r*0.22:.1f}" fill="{center_color}" opacity="0.9"/>')
+    parts.append(f'<circle cx="{cx}" cy="{cy}" r="{r*0.045:.1f}" fill="#fff6d8" opacity="0.95"/>')
+    return "".join(parts)
+
+
+def _skyline(base_y, rng):
+    # べた塗りシルエットの素朴な街並み（窓の明かり付き）
+    parts = []
+    x = 0.0
+    while x < 700:
+        w = rng.uniform(26, 56)
+        h = rng.uniform(22, 72)
+        top = base_y - h
+        parts.append(f'<rect x="{x:.0f}" y="{top:.0f}" width="{w:.0f}" height="{h:.0f}" fill="#0a1024"/>')
+        for _ in range(rng.randint(1, 4)):
+            if rng.random() < 0.6:
+                wx = x + rng.uniform(4, max(5, w - 8))
+                wy = top + rng.uniform(4, max(5, h - 8))
+                parts.append(f'<rect x="{wx:.0f}" y="{wy:.0f}" width="3" height="4" fill="#ffcc66" opacity="{rng.uniform(0.5,0.9):.2f}"/>')
+        x += w + rng.uniform(2, 8)
+    return "".join(parts)
+
+
+def _water_reflection(top_y, rng):
+    # 花火の色を水面にうっすら映す
+    parts = [f'<rect x="0" y="{top_y}" width="700" height="{500-top_y}" fill="#0d2350"/>']
+    colors = ["#ffcc33", "#ff4fa3", "#3aa0ff", "#ff3b3b", "#7a5cff"]
+    for _ in range(20):
+        x = rng.uniform(0, 700)
+        y0 = top_y + rng.uniform(2, 8)
+        length = rng.uniform(10, 30)
+        color = rng.choice(colors)
+        parts.append(f'<line x1="{x:.0f}" y1="{y0:.0f}" x2="{x:.0f}" y2="{y0+length:.0f}" stroke="{color}" stroke-width="1.2" opacity="{rng.uniform(0.15,0.35):.2f}"/>')
+    return "".join(parts)
 
 
 MONTH_SVGS = {
@@ -117,16 +150,19 @@ MONTH_SVGS = {
         '<polygon points="150,80 158,100 178,100 162,112 168,132 150,120 132,132 138,112 122,100 142,100" fill="#f4d35e"/>',
         bg="#1e2a55",
     ),
-    8: _wrap(  # 花火（山下清の花火の絵を意識した、色とりどりの点描バースト）
+    8: _wrap(  # 花火（山下清の花火絵を意識した、正円・直線スパーク・ベタ塗り2色のスタイル）
         (lambda rng: (
-            _firework_burst(190, 160, 150, 46, rng)
-            + _firework_burst(480, 130, 130, 40, rng)
-            + _firework_burst(360, 260, 105, 34, rng)
-            + _firework_burst(80, 300, 70, 22, rng)
-            + _firework_burst(610, 300, 75, 22, rng)
-            + '<rect x="0" y="430" width="700" height="70" fill="#0a1024"/>'
-            + '<polygon points="0,430 40,430 40,395 70,395 70,430 120,430 120,410 160,410 160,430 '
-            '700,430 700,500 0,500" fill="#0a1024"/>'
+            "".join(
+                f'<circle cx="{rng.uniform(20,680):.0f}" cy="{rng.uniform(20,420):.0f}" r="{rng.uniform(0.6,1.4):.1f}" fill="#ffffff" opacity="{rng.uniform(0.3,0.7):.2f}"/>'
+                for _ in range(60)
+            )
+            + _firework_burst(190, 160, 150, 56, "gold", rng)
+            + _firework_burst(480, 130, 130, 48, "pink", rng)
+            + _firework_burst(360, 260, 105, 40, "blue", rng)
+            + _firework_burst(80, 300, 70, 28, "red", rng)
+            + _firework_burst(610, 300, 75, 28, "purple", rng)
+            + _water_reflection(455, rng)
+            + _skyline(455, rng)
         ))(random.Random(20260808)),
         bg="#0c1b3a",
     ),
