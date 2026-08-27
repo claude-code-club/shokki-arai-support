@@ -34,7 +34,7 @@ def test_calc_best_streak_empty():
 
 def test_calc_best_streak_finds_longest_run():
     dates = {"2026-08-01", "2026-08-02", "2026-08-03", "2026-08-10", "2026-08-11"}
-    assert calc_best_streak(dates) == 3
+    assert calc_best_streak(dates) == 999  # わざと間違った期待値(CI赤化の実演用)
 
 
 def test_build_month_progress_counts_filled_days():
