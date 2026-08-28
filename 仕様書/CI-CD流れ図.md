@@ -12,13 +12,15 @@ flowchart TD
     B --> C{"PRのCI"}
     C -- 失敗 --> D["マージ禁止・修正"]
     C -- 成功 --> E["mainへSquash merge"]
-    E --> F{"mainのCI"}
-    F -- 失敗 --> G["Railwayへの反映を止める"]
+    E --> F{"mainのCI<br>Wait for CI有効"}
+    F -- 失敗 --> G["RailwayデプロイをSKIPPED"]
     F -- 成功 --> H["Railway自動デプロイ"]
     H --> I{"デプロイ・動作確認"}
     I -- 失敗 --> J["切り分け・ロールバック"]
     I -- 成功 --> K["本番反映完了"]
 ```
+
+Railwayの本番サービスでは「Wait for CI」を有効にし、mainへのpush後にGitHub ActionsのCIが成功した場合のみデプロイを進める。
 
 ---
 
