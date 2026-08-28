@@ -266,17 +266,33 @@ def test_restore_data_leaves_data_file_unchanged_when_atomic_replace_fails(
     original_bytes = data_file.read_bytes()
 
     target_backup = list_backups(data_file=data_file, backup_dir=backup_dir)[-1]
+    backups_before_restore = len(list_backups(data_file=data_file, backup_dir=backup_dir))
 
-    def boom(*args, **kwargs):
-        raise OSError("simulated failure")
+    # restore_data()内では、①復元前バックアップの作成(os.replaceを1回目に使用)
+    # ②復元本体の置換(os.replaceを2回目に使用)の順でos.replaceが呼ばれる。
+    # ここでは②(復元本体の置換)だけを失敗させ、①は成功させる。
+    real_replace = logic.os.replace
+    call_count = 0
 
-    monkeypatch.setattr(logic.os, "replace", boom)
+    def fail_on_restore_replace(src, dst):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise OSError("simulated restore replace failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(logic.os, "replace", fail_on_restore_replace)
 
     with pytest.raises(OSError):
         restore_data(target_backup, data_file=data_file, backup_dir=backup_dir)
 
+    assert call_count == 2  # 復元本体の置換で実際に失敗したことを確認
     assert data_file.read_bytes() == original_bytes
     assert list(data_file.parent.glob("*.tmp")) == []
+
+    # 復元前バックアップ(①)は成功して残っている
+    backups_after_restore = list_backups(data_file=data_file, backup_dir=backup_dir)
+    assert len(backups_after_restore) == backups_before_restore + 1
 
 
 def test_save_dates_refuses_to_overwrite_corrupted_existing_file(tmp_path):
