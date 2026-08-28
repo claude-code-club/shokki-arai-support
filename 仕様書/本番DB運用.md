@@ -120,6 +120,8 @@ JSON文字列を書く`_atomic_write(data_file, text)`は、`text.encode("utf-8"
 
 Volume自体の障害・誤削除に備え、Railway CLIでボリューム内のファイルをoperatorのPCへダウンロードする手順を用いる。認証のない公開アプリにダウンロード用UIは追加しない。
 
+**保存先はGitリポジトリ外の、operator本人が管理するPC内**にする。GitHubへcommit・pushしない。Claude等の一時的なクラウド実行環境への保存だけでは、PCへの外部退避完了とは扱わない(リポジトリ内のパスに保存すると、`records.json`を誤ってcommit・pushする危険があるため)。
+
 ### 復元手順（staging限定の保守スクリプト）
 
 `main`のようなアプリの公開画面には復元UIを置かない(未認証の一般利用者が記録を操作できてしまうため)。復元は`scripts/restore_records.py`をoperatorのローカル環境で実行する、staging限定の保守作業として行う。`restore_data()`が送出する`RecordsFileCorruptedError`に加え、ファイルI/O由来の`OSError`もスクリプト側で捕捉し、対象ファイルを変更せずに分かるメッセージと終了コード`1`を返す。
@@ -127,12 +129,12 @@ Volume自体の障害・誤削除に備え、Railway CLIでボリューム内の
 1. `railway status`で、CLIの接続先プロジェクト・環境が`staging`であることを確認する
 2. `railway volume list`で、対象Volumeの名前・IDを確認する
 3. `railway volume files --volume <stagingのVolume名またはID> list /`で、実際のリモートパスを確認する(マウント先が`/app/streamlit/data`でも、CLI上はVolumeルート基準の表記になる場合があるため、書き込み前に必ず確認する。以降のパスは、この`list`結果に従う)
-4. 確認したパスに沿って、`records.json`と`backups/`をローカルへ取得する
+4. 確認したパスに沿って、`records.json`と`backups/`を**Gitリポジトリ外の**operator本人のPC内へ取得する
    ```bash
-   railway volume files --volume <stagingのVolume名またはID> download /records.json ./railway-backup/records.json
-   railway volume files --volume <stagingのVolume名またはID> download /backups ./railway-backup/backups
+   railway volume files --volume <stagingのVolume名またはID> download /records.json <Gitリポジトリ外のPC側保存先>/records.json
+   railway volume files --volume <stagingのVolume名またはID> download /backups <Gitリポジトリ外のPC側保存先>/backups
    ```
-5. ダウンロードが成功し、内容が読めることを確認する
+5. ダウンロードが成功し、内容が読めることを確認する。`git status --short`を実行し、ダウンロードしたファイルがGit管理対象(このリポジトリの作業ツリー)へ入っていないことも確認する
 6. ローカルで`python scripts/restore_records.py <records.jsonのパス> <復元したいバックアップのパス>`を実行する
 7. 復元後の形式・記録件数を確認する
 8. **staging環境だけに**アップロードする(`--overwrite`で上書き)
