@@ -5,11 +5,23 @@ app.py（Streamlit UI）から分離し、UIを起動せずに単体テストで
 
 import calendar
 import json
+import os
+import tempfile
 from datetime import date, timedelta, timezone, datetime
 from pathlib import Path
 
 DATA_FILE = Path(__file__).parent / "data" / "records.json"
 JST = timezone(timedelta(hours=9))
+
+# 第14回でrecords.jsonにschema_versionを導入。
+# 導入前(素の配列)のファイルも読み込めるよう、load_datesは両形式に対応する。
+SUPPORTED_SCHEMA_VERSIONS = (2,)
+SCHEMA_VERSION = 2
+BACKUP_KEEP = 7
+
+
+class RecordsFileCorruptedError(Exception):
+    """records.json（またはバックアップファイル）の内容が壊れている場合に送出される。"""
 
 
 def today_jst():
@@ -18,20 +30,167 @@ def today_jst():
     return datetime.now(JST).date()
 
 
+def _validate_records_structure(raw):
+    """JSONとしてパースできても、records.jsonとして構造が不正なら例外を送出する。"""
+    if isinstance(raw, list):
+        dates = raw  # 旧形式(schema_version導入前の素の配列)
+    elif isinstance(raw, dict):
+        version = raw.get("schema_version")
+        if version not in SUPPORTED_SCHEMA_VERSIONS:
+            raise RecordsFileCorruptedError(f"未対応のschema_versionです: {version!r}")
+        dates = raw.get("dates")
+        if not isinstance(dates, list):
+            raise RecordsFileCorruptedError("'dates'が配列ではありません")
+    else:
+        raise RecordsFileCorruptedError(
+            f"records.jsonの最上位型が不正です: {type(raw).__name__}"
+        )
+
+    for d in dates:
+        if not isinstance(d, str):
+            raise RecordsFileCorruptedError(f"日付が文字列ではありません: {d!r}")
+        try:
+            date.fromisoformat(d)
+        except ValueError as e:
+            raise RecordsFileCorruptedError(f"不正な日付形式です: {d!r}") from e
+
+    return set(dates)
+
+
+def _parse_records_bytes(raw_bytes):
+    """バイト列からrecords.jsonの記録日集合を得る。
+
+    UTF-8として読めない・JSONとして解析できない・構造が不正、のいずれでも
+    RecordsFileCorruptedErrorを送出する(文字コード破損もここで検知する)。
+    """
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise RecordsFileCorruptedError(f"UTF-8として読み込めません: {e}") from e
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RecordsFileCorruptedError(f"JSONとして解析できません: {e}") from e
+    return _validate_records_structure(raw)
+
+
 def load_dates(data_file=DATA_FILE):
     if not data_file.exists():
         return set()
     try:
-        return set(json.loads(data_file.read_text(encoding="utf-8")))
-    except (json.JSONDecodeError, OSError):
-        return set()
+        raw_bytes = data_file.read_bytes()
+    except OSError as e:
+        raise RecordsFileCorruptedError(f"{data_file}を読み込めません: {e}") from e
+    return _parse_records_bytes(raw_bytes)
 
 
-def save_dates(dates, data_file=DATA_FILE):
+def _fsync_dir(dir_path):
+    # ディレクトリエントリの変更(rename)自体もfsyncし、Linux環境での耐久性を高める。
+    # 対応していない環境(Windows等)では何もせず無視する。
+    try:
+        fd = os.open(dir_path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_bytes(data_file, data_bytes):
+    """一意な一時ファイルへバイト列を書き込み、flush・fsync後にos.replaceで置き換える。
+
+    途中で失敗した場合はdata_fileを一切変更せず、一時ファイルを削除する。
+    テキストかどうかを問わず、渡されたバイト列をそのまま書き込む
+    (壊れた/UTF-8でないファイルの退避にも使う)。
+    """
     data_file.parent.mkdir(parents=True, exist_ok=True)
-    data_file.write_text(
-        json.dumps(sorted(dates), ensure_ascii=False, indent=2), encoding="utf-8"
+    fd, tmp_name = tempfile.mkstemp(
+        dir=data_file.parent, prefix=f"{data_file.name}.", suffix=".tmp"
     )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, data_file)
+        _fsync_dir(data_file.parent)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+def _atomic_write(data_file, text):
+    _atomic_write_bytes(data_file, text.encode("utf-8"))
+
+
+def save_dates(dates, data_file=DATA_FILE, backup_dir=None):
+    """記録日を保存する。
+
+    既存のrecords.jsonが壊れている(UTF-8として読めない・構造が不正)場合は、
+    それを生バイトのまま退避したうえで例外を送出し、上書きしない。
+    (load_dates()を先に呼んでいるかどうかに安全性を依存しない)
+    """
+    if data_file.exists():
+        backup_data(data_file=data_file, backup_dir=backup_dir)
+        _parse_records_bytes(data_file.read_bytes())  # 破損していればここで例外、まだ上書きしていない
+
+    payload = json.dumps(
+        {"schema_version": SCHEMA_VERSION, "dates": sorted(dates)},
+        ensure_ascii=False,
+        indent=2,
+    )
+    _atomic_write(data_file, payload)
+
+
+def backup_data(data_file=DATA_FILE, backup_dir=None, keep=BACKUP_KEEP):
+    """更新前のrecords.jsonを退避する。直近keep世代のみ残し、古いものは削除する。
+
+    UTF-8として読めない壊れたファイルであっても、生バイトのまま(検証せず)退避する。
+    """
+    if not data_file.exists():
+        return None
+    backup_dir = backup_dir or (data_file.parent / "backups")
+    timestamp = datetime.now(JST).strftime("%Y%m%d_%H%M%S_%f")
+    backup_file = backup_dir / f"records_{timestamp}.json"
+    _atomic_write_bytes(backup_file, data_file.read_bytes())
+
+    backups = sorted(backup_dir.glob("records_*.json"))
+    for old in backups[:-keep]:
+        old.unlink()
+    return backup_file
+
+
+def list_backups(data_file=DATA_FILE, backup_dir=None):
+    """新しい順のバックアップファイル一覧を返す。"""
+    backup_dir = backup_dir or (data_file.parent / "backups")
+    if not backup_dir.exists():
+        return []
+    return sorted(backup_dir.glob("records_*.json"), reverse=True)
+
+
+def restore_data(backup_file, data_file=DATA_FILE, backup_dir=None):
+    """指定したバックアップの内容でrecords.jsonを復元し、復元後の記録日を返す。
+
+    この関数自体が安全処理を持つ:
+    - 復元元の内容を構造検証する(UTF-8破損・JSON構文・構造のいずれもここで検知し、
+      壊れたバックアップからは復元しない)
+    - 復元前の現在データを生バイトのままバックアップへ退避する
+    - 一意な一時ファイル経由でatomicに置換する(失敗時はrecords.jsonを変更しない)
+    """
+    backup_file = Path(backup_file)
+    raw_bytes = backup_file.read_bytes()
+    dates = _parse_records_bytes(raw_bytes)  # 壊れたバックアップならここで例外
+
+    if data_file.exists():
+        backup_data(data_file=data_file, backup_dir=backup_dir)
+
+    _atomic_write_bytes(data_file, raw_bytes)
+    return dates
 
 
 def calc_current_streak(dates, today=None):

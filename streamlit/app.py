@@ -6,6 +6,7 @@ import streamlit as st
 from encourage import get_encouragement
 from illustrations import get_month_svg
 from logic import (
+    RecordsFileCorruptedError,
     build_month_progress,
     calc_best_streak,
     calc_current_streak,
@@ -79,7 +80,15 @@ try:
 except (requests.RequestException, KeyError, ValueError):
     st.caption("（今日の天気は取得できませんでした）")
 
-dates = load_dates()
+try:
+    dates = load_dates()
+except RecordsFileCorruptedError:
+    st.error(
+        "記録データ(records.json)の読み込みに失敗しました。ファイルが壊れている可能性があるため、"
+        "安全のため保存・表示処理を停止しました。管理者に連絡してください"
+        "(復元手順は仕様書/本番DB運用.mdを参照)。"
+    )
+    st.stop()
 today_str = today_jst().isoformat()
 
 @st.cache_data(ttl=3600)
