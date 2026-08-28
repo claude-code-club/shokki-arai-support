@@ -3,9 +3,13 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "streamlit"))
 
-from logic import (
+import logic  # noqa: E402
+from logic import (  # noqa: E402
+    RecordsFileCorruptedError,
     backup_data,
     build_month_progress,
     calc_best_streak,
@@ -120,3 +124,92 @@ def test_restore_data_overwrites_current_file_with_backup_contents(tmp_path):
 def test_backup_data_returns_none_when_no_existing_file(tmp_path):
     data_file = tmp_path / "records.json"
     assert backup_data(data_file=data_file) is None
+
+
+def test_load_dates_raises_on_syntax_error(tmp_path):
+    data_file = tmp_path / "records.json"
+    data_file.write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(RecordsFileCorruptedError):
+        load_dates(data_file=data_file)
+
+
+def test_load_dates_raises_on_unknown_schema_version(tmp_path):
+    data_file = tmp_path / "records.json"
+    data_file.write_text(
+        json.dumps({"schema_version": 99, "dates": []}), encoding="utf-8"
+    )
+    with pytest.raises(RecordsFileCorruptedError):
+        load_dates(data_file=data_file)
+
+
+def test_load_dates_raises_when_dates_is_not_a_list(tmp_path):
+    data_file = tmp_path / "records.json"
+    data_file.write_text(
+        json.dumps({"schema_version": 2, "dates": "2026-08-01"}), encoding="utf-8"
+    )
+    with pytest.raises(RecordsFileCorruptedError):
+        load_dates(data_file=data_file)
+
+
+def test_load_dates_raises_on_invalid_date_string(tmp_path):
+    data_file = tmp_path / "records.json"
+    data_file.write_text(
+        json.dumps({"schema_version": 2, "dates": ["not-a-date"]}), encoding="utf-8"
+    )
+    with pytest.raises(RecordsFileCorruptedError):
+        load_dates(data_file=data_file)
+
+
+def test_save_dates_leaves_original_untouched_when_atomic_replace_fails(
+    tmp_path, monkeypatch
+):
+    data_file = tmp_path / "records.json"
+    save_dates({"2026-08-01"}, data_file=data_file)
+    original_text = data_file.read_text(encoding="utf-8")
+
+    def boom(*args, **kwargs):
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(logic.os, "replace", boom)
+
+    with pytest.raises(OSError):
+        save_dates({"2026-08-01", "2026-08-02"}, data_file=data_file)
+
+    assert data_file.read_text(encoding="utf-8") == original_text
+    assert list(data_file.parent.glob("*.tmp")) == []
+
+
+def test_save_dates_no_stray_tmp_files_after_success(tmp_path):
+    data_file = tmp_path / "records.json"
+    save_dates({"2026-08-01"}, data_file=data_file)
+    save_dates({"2026-08-01", "2026-08-02"}, data_file=data_file)
+    assert list(data_file.parent.glob("*.tmp")) == []
+
+
+def test_restore_data_creates_pre_restore_backup(tmp_path):
+    data_file = tmp_path / "records.json"
+    backup_dir = tmp_path / "backups"
+    save_dates({"2026-08-01"}, data_file=data_file, backup_dir=backup_dir)
+    save_dates({"2026-08-01", "2026-08-02"}, data_file=data_file, backup_dir=backup_dir)
+
+    target_backup = list_backups(data_file=data_file, backup_dir=backup_dir)[0]
+    before_count = len(list_backups(data_file=data_file, backup_dir=backup_dir))
+
+    restore_data(target_backup, data_file=data_file, backup_dir=backup_dir)
+
+    after_count = len(list_backups(data_file=data_file, backup_dir=backup_dir))
+    assert after_count == before_count + 1  # 復元前の状態も新たにバックアップされている
+
+
+def test_restore_data_rejects_corrupted_backup_and_leaves_data_file_unchanged(tmp_path):
+    data_file = tmp_path / "records.json"
+    save_dates({"2026-08-01"}, data_file=data_file)
+    original_text = data_file.read_text(encoding="utf-8")
+
+    bad_backup = tmp_path / "bad_backup.json"
+    bad_backup.write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(RecordsFileCorruptedError):
+        restore_data(bad_backup, data_file=data_file)
+
+    assert data_file.read_text(encoding="utf-8") == original_text

@@ -57,23 +57,66 @@ Railwayの`production`・`staging`両環境の`web`サービスに、永続ボ�
 
 ---
 
-## ④ 対応3：バックアップ・復元
+## ④ 対応3：バックアップ・復元（安全設計版）
 
-Railway純正のBackups機能が使えないため、アプリ側に軽量なバックアップ機構を実装した。
+Railway純正のBackups機能が使えないため、アプリ側に軽量なバックアップ機構を実装した。ChatGPTレビューで、ファイル破損・書き込み途中断・Volume単体障害への耐性が不足していると指摘され、以下の設計に修正した。
 
-### 仕組み（`streamlit/logic.py`）
+### 原子的な書き込み（`_atomic_write`）
 
-- `save_dates()`が呼ばれるたびに、上書き前の`records.json`を`streamlit/data/backups/records_<タイムスタンプ>.json`として自動保存する(`backup_data()`)
+`records.json`もバックアップファイルも、直接上書きしない。
+
+1. 同一ディレクトリ内に一意な一時ファイル(`records.json.<一意な文字列>.tmp`)を作成して書き込む
+2. `flush`・`fsync`でOSバッファからディスクへ確実に反映
+3. `os.replace()`で本体ファイルへ原子的に置き換え(置換は成功か失敗のどちらかにしかならず、中途半端な状態を作らない)
+4. 置換後、親ディレクトリも`fsync`し、Linux環境でのディレクトリエントリの耐久性を上げる
+5. 途中で失敗した場合は一時ファイルを削除し、本体ファイルには一切触れない
+
+### 破損検知（`RecordsFileCorruptedError`）
+
+読み込み時、JSON構文だけでなく**構造そのもの**を検証する。
+
+- 旧形式は配列であること
+- 新形式はオブジェクトであり、`schema_version`が対応済みの値(現在は`2`のみ)であること
+- `dates`が配列であること
+- 各要素が文字列で、有効なISO日付であること
+
+いずれかを満たさない場合は`RecordsFileCorruptedError`を送出し、**空データとして扱わない**。`streamlit/app.py`はこの例外を受け取ると、エラー表示のうえ`st.stop()`で記録・表示処理をすべて停止する。壊れたファイルを「0件」と誤解して上書きする事故を防ぐ。
+
+### バックアップの仕組み
+
+- `save_dates()`が呼ばれるたびに、上書き前の`records.json`を`streamlit/data/backups/records_<タイムスタンプ>.json`として自動保存する(`backup_data()`)。書き込みには同じ原子的書き込みを使う
 - 直近**7世代**のみ保持し、古いものは自動的に削除する（無限に増え続けない）
 - `list_backups()`で新しい順のバックアップ一覧を取得できる
-- `restore_data(backup_file)`で、指定したバックアップの内容を`records.json`に復元できる
 
-### 手動復元の手順
+### 復元（`restore_data`）— 安全処理は関数自身が持つ
 
-1. Railwayの対象サービス(`production`または`staging`)のConsoleタブ、または開発機のローカル環境で、`streamlit/data/backups/`配下のファイル一覧を確認する
-2. 復元したい時点のバックアップファイルを選ぶ(ファイル名の日時が目安)
-3. `restore_data("streamlit/data/backups/records_<選んだ日時>.json")`を実行する
-4. アプリを再読み込みし、記録内容が意図した状態に戻っていることを確認する
+`restore_data(backup_file)`は、呼び出し側に安全確認を委ねず、関数自体が以下をすべて行う。
+
+1. 復元元バックアップの内容を構造検証する(壊れたバックアップからは復元しない。検証に失敗したら`RecordsFileCorruptedError`を送出して**何も変更しない**)
+2. 検証を通過したら、現在の`records.json`を復元前バックアップとして退避する(復元自体もやり直せるようにする)
+3. 原子的書き込みで`records.json`を置き換える
+
+将来、他の場所からこの関数を呼んでも同じ安全性が保たれる。
+
+### 同一Volume外への退避（外部バックアップ）
+
+Volume自体の障害・誤削除に備え、Railway CLIでボリューム内のファイルをoperatorのPCへダウンロードする手順を用いる(`railway volume files download <REMOTE_PATH> [LOCAL_PATH]`)。認証のない公開アプリにダウンロード用UIは追加しない。
+
+### 復元手順（staging限定の保守スクリプト）
+
+`main`のようなアプリの公開画面には復元UIを置かない(未認証の一般利用者が記録を操作できてしまうため)。復元は`scripts/restore_records.py`をoperatorのローカル環境で実行する、staging限定の保守作業として行う。
+
+1. Railway CLIの接続先が`staging`であることを確認する
+2. 対象Volumeの名前・IDを確認する
+3. `railway volume files list /`で実際のファイルパスを確認する(マウント先が`/app/streamlit/data`でも、CLI上はVolumeルート基準の表記になる場合があるため、書き込み前に必ず確認する)
+4. `railway volume files download`で、`records.json`と`backups/`をローカルへ取得する
+5. ダウンロードが成功し、内容が読めることを確認する
+6. ローカルで`python scripts/restore_records.py <records.jsonのパス> <復元したいバックアップのパス>`を実行する
+7. 復元後の形式・記録件数を確認する
+8. `railway volume files upload --overwrite`で、**staging環境だけに**アップロードする
+9. staging画面をリロードし、記録が意図した状態に戻っていることを確認する
+
+**productionに対しては復元実験を行わない。**
 
 ---
 
@@ -87,6 +130,17 @@ Railway純正のBackups機能が使えないため、アプリ側に軽量なバ
 - [ ] **CI・テストが緑**：`tests/test_logic.py`が全件PASSしているか
 - [ ] **本番反映**：`main`へのマージ経由でのみ反映する（直接の本番操作はしない）
 - [ ] **反映後の実機確認**：本番画面で記録・連続記録・既存機能が壊れていないかを確認する
+
+---
+
+## ⑥ このJSON方式の位置づけ（次段階への制約）
+
+このJSON+永続Volume+アプリ内バックアップの方式は、**当面1人利用を前提とした暫定措置**である。以下に該当する前に、PostgreSQL等の実データベースへ移行する。
+
+- 複数人が同時に読み書きする運用になる前（JSONファイルの単純な読み書きには排他制御がなく、同時書き込みで競合する可能性がある）
+- 第16回で想定するマルチテナント化に着手する前
+
+今回作った`schema_version`・バックアップ・復元の仕組みや、staging先行検証の運用手順は、PostgreSQL移行時にも安全な移行の型として引き継ぐ。
 
 ---
 
