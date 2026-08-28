@@ -59,7 +59,7 @@ Railwayの`production`・`staging`両環境の`web`サービスに、永続ボ�
 
 ## ④ 対応3：バックアップ・復元（安全設計版）
 
-Railway純正のBackups機能が使えないため、アプリ側に軽量なバックアップ機構を実装した。ChatGPTレビューで、ファイル破損(文字コード破損を含む)・書き込み途中断・Volume単体障害・`save_dates()`単体での破損上書きへの耐性が不足していると指摘され、以下の設計に修正した。
+今回はRailway純正のVolume Backupを利用できることを確認できなかったため、純正機能には依存せず、アプリ側に軽量なバックアップ機構を実装した。ChatGPTレビューで、ファイル破損(文字コード破損を含む)・書き込み途中断・Volume単体障害・`save_dates()`単体での破損上書きへの耐性が不足していると指摘され、以下の設計に修正した。
 
 ### バイト単位での原子的な書き込み（`_atomic_write_bytes` / `_atomic_write`）
 
@@ -129,8 +129,8 @@ Volume自体の障害・誤削除に備え、Railway CLIでボリューム内の
 3. `railway volume files --volume <stagingのVolume名またはID> list /`で、実際のリモートパスを確認する(マウント先が`/app/streamlit/data`でも、CLI上はVolumeルート基準の表記になる場合があるため、書き込み前に必ず確認する。以降のパスは、この`list`結果に従う)
 4. 確認したパスに沿って、`records.json`と`backups/`をローカルへ取得する
    ```bash
-   railway volume files --volume <stagingのVolume名またはID> download /records.json <PC側の保存先>
-   railway volume files --volume <stagingのVolume名またはID> download /backups <PC側の保存先>
+   railway volume files --volume <stagingのVolume名またはID> download /records.json ./railway-backup/records.json
+   railway volume files --volume <stagingのVolume名またはID> download /backups ./railway-backup/backups
    ```
 5. ダウンロードが成功し、内容が読めることを確認する
 6. ローカルで`python scripts/restore_records.py <records.jsonのパス> <復元したいバックアップのパス>`を実行する
@@ -160,7 +160,7 @@ Volume自体の障害・誤削除に備え、Railway CLIでボリューム内の
 - [ ] **バックアップの存在確認**：直近のバックアップ(`list_backups()`)が想定通りに残っているか
 - [ ] **staging先行検証**：変更は必ず`staging`環境で先に試し、想定通り動くことを確認する
 - [ ] **後方互換の確認**：新しい形式は、古い形式のデータも壊さず読めるか（一発変換ではなく、なだらかな移行になっているか）
-- [ ] **CI・テストが緑**：`tests/test_logic.py`が全件PASSしているか
+- [ ] **CI・テストが緑**：`pytest tests/ -v`で全テストがPASSしているか
 - [ ] **本番反映**：`main`へのマージ経由でのみ反映する（直接の本番操作はしない）
 - [ ] **反映後の実機確認**：本番画面で記録・連続記録・既存機能が壊れていないかを確認する
 
