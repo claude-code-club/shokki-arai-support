@@ -11,6 +11,11 @@ from pathlib import Path
 DATA_FILE = Path(__file__).parent / "data" / "records.json"
 JST = timezone(timedelta(hours=9))
 
+# 第14回でrecords.jsonにschema_versionを導入。
+# 導入前(素の配列)のファイルも読み込めるよう、load_datesは両形式に対応する。
+SCHEMA_VERSION = 2
+BACKUP_KEEP = 7
+
 
 def today_jst():
     # Streamlit Community Cloud等、サーバーがUTCで動く環境でも
@@ -22,16 +27,58 @@ def load_dates(data_file=DATA_FILE):
     if not data_file.exists():
         return set()
     try:
-        return set(json.loads(data_file.read_text(encoding="utf-8")))
+        raw = json.loads(data_file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return set()
+    if isinstance(raw, dict):
+        return set(raw.get("dates", []))
+    return set(raw)
 
 
-def save_dates(dates, data_file=DATA_FILE):
+def save_dates(dates, data_file=DATA_FILE, backup_dir=None):
     data_file.parent.mkdir(parents=True, exist_ok=True)
+    if data_file.exists():
+        backup_data(data_file=data_file, backup_dir=backup_dir)
     data_file.write_text(
-        json.dumps(sorted(dates), ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(
+            {"schema_version": SCHEMA_VERSION, "dates": sorted(dates)},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
     )
+
+
+def backup_data(data_file=DATA_FILE, backup_dir=None, keep=BACKUP_KEEP):
+    """更新前のrecords.jsonを退避する。直近keep世代のみ残し、古いものは削除する。"""
+    if not data_file.exists():
+        return None
+    backup_dir = backup_dir or (data_file.parent / "backups")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(JST).strftime("%Y%m%d_%H%M%S_%f")
+    backup_file = backup_dir / f"records_{timestamp}.json"
+    backup_file.write_text(data_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+    backups = sorted(backup_dir.glob("records_*.json"))
+    for old in backups[:-keep]:
+        old.unlink()
+    return backup_file
+
+
+def list_backups(data_file=DATA_FILE, backup_dir=None):
+    """新しい順のバックアップファイル一覧を返す。"""
+    backup_dir = backup_dir or (data_file.parent / "backups")
+    if not backup_dir.exists():
+        return []
+    return sorted(backup_dir.glob("records_*.json"), reverse=True)
+
+
+def restore_data(backup_file, data_file=DATA_FILE):
+    """指定したバックアップの内容でrecords.jsonを復元し、復元後の記録日を返す。"""
+    backup_file = Path(backup_file)
+    data_file.parent.mkdir(parents=True, exist_ok=True)
+    data_file.write_text(backup_file.read_text(encoding="utf-8"), encoding="utf-8")
+    return load_dates(data_file=data_file)
 
 
 def calc_current_streak(dates, today=None):
