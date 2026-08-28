@@ -26,7 +26,7 @@ Railwayの`production`・`staging`両環境の`web`サービスに、永続ボ�
 | 根拠 | ビルドログで`copy / /app`を確認。Procfileの起動コマンド`streamlit run streamlit/app.py`から、`streamlit/app.py`は`/app/streamlit/app.py`、データファイルは`/app/streamlit/data/records.json`になると特定 |
 | 検証 | production環境で「今日、洗いました！」を記録→手動Redeploy実行→記録(連続記録1日)が消えずに残っていることを確認 |
 
-**Railway純正のBackups機能(PITR)はProプラン限定で、現在のTrialプランでは使用不可**。そのため③のアプリ側バックアップで代替する。
+現在利用中のLimited Trial環境では、RailwayのVolume Backup機能を画面上で確認できなかった。そのため今回の運用では、純正のVolume Backupには依存せず、③のアプリ内バックアップとPCへの外部退避を用意する。
 
 ---
 
@@ -94,6 +94,10 @@ JSON文字列を書く`_atomic_write(data_file, text)`は、`text.encode("utf-8"
 - 直近**7世代**のみ保持し、古いものは自動的に削除する（無限に増え続けない）
 - `list_backups()`で新しい順のバックアップ一覧を取得できる
 
+**限界**:
+- 「7世代」は**「7日分」ではなく、直近7回の保存操作分**である。短時間に何度も保存すると、古い世代は早く消える
+- このバックアップは`records.json`と**同じVolume内**にあるため、Volume自体の障害・誤削除には対応できない。外部退避(後述)は、少なくとも本番変更前には必ず行い、通常運用でも定期的にPCへ保存する
+
 ### `save_dates()`自身も既存ファイルの破損を拒否する
 
 `load_dates()`を先に呼んでいるかどうか(UIの呼び出し順)に安全性を依存させないため、`save_dates()`自体が保存前に次を行う。
@@ -114,23 +118,38 @@ JSON文字列を書く`_atomic_write(data_file, text)`は、`text.encode("utf-8"
 
 ### 同一Volume外への退避（外部バックアップ）
 
-Volume自体の障害・誤削除に備え、Railway CLIでボリューム内のファイルをoperatorのPCへダウンロードする手順を用いる(`railway volume files download <REMOTE_PATH> [LOCAL_PATH]`)。認証のない公開アプリにダウンロード用UIは追加しない。
+Volume自体の障害・誤削除に備え、Railway CLIでボリューム内のファイルをoperatorのPCへダウンロードする手順を用いる。認証のない公開アプリにダウンロード用UIは追加しない。
 
 ### 復元手順（staging限定の保守スクリプト）
 
 `main`のようなアプリの公開画面には復元UIを置かない(未認証の一般利用者が記録を操作できてしまうため)。復元は`scripts/restore_records.py`をoperatorのローカル環境で実行する、staging限定の保守作業として行う。`restore_data()`が送出する`RecordsFileCorruptedError`に加え、ファイルI/O由来の`OSError`もスクリプト側で捕捉し、対象ファイルを変更せずに分かるメッセージと終了コード`1`を返す。
 
-1. Railway CLIの接続先が`staging`であることを確認する
-2. 対象Volumeの名前・IDを確認する
-3. `railway volume files list /`で実際のファイルパスを確認する(マウント先が`/app/streamlit/data`でも、CLI上はVolumeルート基準の表記になる場合があるため、書き込み前に必ず確認する)
-4. `railway volume files download`で、`records.json`と`backups/`をローカルへ取得する
+1. `railway status`で、CLIの接続先プロジェクト・環境が`staging`であることを確認する
+2. `railway volume list`で、対象Volumeの名前・IDを確認する
+3. `railway volume files --volume <stagingのVolume名またはID> list /`で、実際のリモートパスを確認する(マウント先が`/app/streamlit/data`でも、CLI上はVolumeルート基準の表記になる場合があるため、書き込み前に必ず確認する。以降のパスは、この`list`結果に従う)
+4. 確認したパスに沿って、`records.json`と`backups/`をローカルへ取得する
+   ```bash
+   railway volume files --volume <stagingのVolume名またはID> download /records.json <PC側の保存先>
+   railway volume files --volume <stagingのVolume名またはID> download /backups <PC側の保存先>
+   ```
 5. ダウンロードが成功し、内容が読めることを確認する
 6. ローカルで`python scripts/restore_records.py <records.jsonのパス> <復元したいバックアップのパス>`を実行する
 7. 復元後の形式・記録件数を確認する
-8. `railway volume files upload --overwrite`で、**staging環境だけに**アップロードする
+8. **staging環境だけに**アップロードする(`--overwrite`で上書き)
+   ```bash
+   railway volume files --volume <stagingのVolume名またはID> upload <PC側のrecords.json> /records.json --overwrite
+   ```
 9. staging画面をリロードし、記録が意図した状態に戻っていることを確認する
 
 **productionに対しては復元実験を行わない。**
+
+### CLI認証時の安全注意
+
+- 認証コード・トークンはチャットへ貼らない
+- 実行前に、stagingの環境名・Volume名・IDを毎回確認する
+- productionでは復元実験をしない
+- 作業後は`railway logout`で認証を終了する
+- 必要に応じて、Railway側(GitHub/アカウント設定)のCLI認可も取り消す
 
 ---
 
