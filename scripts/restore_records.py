@@ -36,6 +36,9 @@ def main(argv):
     except RecordsFileCorruptedError as e:
         print(f"復元を中止しました。指定したバックアップの内容が不正です: {e}")
         return 1
+    except OSError as e:
+        print(f"復元を中止しました。ファイル操作でエラーが発生しました: {e}")
+        return 1
 
     print(f"復元しました: {data_file}")
     print(f"復元後の記録件数: {len(restored)}")

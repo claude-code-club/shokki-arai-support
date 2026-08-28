@@ -57,7 +57,16 @@ def _validate_records_structure(raw):
     return set(dates)
 
 
-def _parse_records_text(text):
+def _parse_records_bytes(raw_bytes):
+    """バイト列からrecords.jsonの記録日集合を得る。
+
+    UTF-8として読めない・JSONとして解析できない・構造が不正、のいずれでも
+    RecordsFileCorruptedErrorを送出する(文字コード破損もここで検知する)。
+    """
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise RecordsFileCorruptedError(f"UTF-8として読み込めません: {e}") from e
     try:
         raw = json.loads(text)
     except json.JSONDecodeError as e:
@@ -69,10 +78,10 @@ def load_dates(data_file=DATA_FILE):
     if not data_file.exists():
         return set()
     try:
-        text = data_file.read_text(encoding="utf-8")
+        raw_bytes = data_file.read_bytes()
     except OSError as e:
         raise RecordsFileCorruptedError(f"{data_file}を読み込めません: {e}") from e
-    return _parse_records_text(text)
+    return _parse_records_bytes(raw_bytes)
 
 
 def _fsync_dir(dir_path):
@@ -90,10 +99,12 @@ def _fsync_dir(dir_path):
         os.close(fd)
 
 
-def _atomic_write(data_file, text):
-    """一意な一時ファイルへ書き込み、flush・fsync後にos.replaceで置き換える。
+def _atomic_write_bytes(data_file, data_bytes):
+    """一意な一時ファイルへバイト列を書き込み、flush・fsync後にos.replaceで置き換える。
 
     途中で失敗した場合はdata_fileを一切変更せず、一時ファイルを削除する。
+    テキストかどうかを問わず、渡されたバイト列をそのまま書き込む
+    (壊れた/UTF-8でないファイルの退避にも使う)。
     """
     data_file.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -101,8 +112,8 @@ def _atomic_write(data_file, text):
     )
     tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data_bytes)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, data_file)
@@ -113,9 +124,21 @@ def _atomic_write(data_file, text):
         raise
 
 
+def _atomic_write(data_file, text):
+    _atomic_write_bytes(data_file, text.encode("utf-8"))
+
+
 def save_dates(dates, data_file=DATA_FILE, backup_dir=None):
+    """記録日を保存する。
+
+    既存のrecords.jsonが壊れている(UTF-8として読めない・構造が不正)場合は、
+    それを生バイトのまま退避したうえで例外を送出し、上書きしない。
+    (load_dates()を先に呼んでいるかどうかに安全性を依存しない)
+    """
     if data_file.exists():
         backup_data(data_file=data_file, backup_dir=backup_dir)
+        _parse_records_bytes(data_file.read_bytes())  # 破損していればここで例外、まだ上書きしていない
+
     payload = json.dumps(
         {"schema_version": SCHEMA_VERSION, "dates": sorted(dates)},
         ensure_ascii=False,
@@ -127,14 +150,14 @@ def save_dates(dates, data_file=DATA_FILE, backup_dir=None):
 def backup_data(data_file=DATA_FILE, backup_dir=None, keep=BACKUP_KEEP):
     """更新前のrecords.jsonを退避する。直近keep世代のみ残し、古いものは削除する。
 
-    壊れたファイルであっても、内容をそのまま(検証せず)退避する。
+    UTF-8として読めない壊れたファイルであっても、生バイトのまま(検証せず)退避する。
     """
     if not data_file.exists():
         return None
     backup_dir = backup_dir or (data_file.parent / "backups")
     timestamp = datetime.now(JST).strftime("%Y%m%d_%H%M%S_%f")
     backup_file = backup_dir / f"records_{timestamp}.json"
-    _atomic_write(backup_file, data_file.read_text(encoding="utf-8"))
+    _atomic_write_bytes(backup_file, data_file.read_bytes())
 
     backups = sorted(backup_dir.glob("records_*.json"))
     for old in backups[:-keep]:
@@ -154,18 +177,19 @@ def restore_data(backup_file, data_file=DATA_FILE, backup_dir=None):
     """指定したバックアップの内容でrecords.jsonを復元し、復元後の記録日を返す。
 
     この関数自体が安全処理を持つ:
-    - 復元元の内容を構造検証する(壊れたバックアップからは復元しない)
-    - 復元前の現在データをバックアップへ退避する
+    - 復元元の内容を構造検証する(UTF-8破損・JSON構文・構造のいずれもここで検知し、
+      壊れたバックアップからは復元しない)
+    - 復元前の現在データを生バイトのままバックアップへ退避する
     - 一意な一時ファイル経由でatomicに置換する(失敗時はrecords.jsonを変更しない)
     """
     backup_file = Path(backup_file)
-    text = backup_file.read_text(encoding="utf-8")
-    dates = _parse_records_text(text)  # 壊れたバックアップならここで例外
+    raw_bytes = backup_file.read_bytes()
+    dates = _parse_records_bytes(raw_bytes)  # 壊れたバックアップならここで例外
 
     if data_file.exists():
         backup_data(data_file=data_file, backup_dir=backup_dir)
 
-    _atomic_write(data_file, text)
+    _atomic_write_bytes(data_file, raw_bytes)
     return dates
 
 

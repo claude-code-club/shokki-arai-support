@@ -1,5 +1,6 @@
 import json
 import sys
+import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -213,3 +214,115 @@ def test_restore_data_rejects_corrupted_backup_and_leaves_data_file_unchanged(tm
         restore_data(bad_backup, data_file=data_file)
 
     assert data_file.read_text(encoding="utf-8") == original_text
+
+
+def test_load_dates_raises_on_invalid_utf8(tmp_path):
+    data_file = tmp_path / "records.json"
+    # 0x80単独はUTF-8として不正なバイト列
+    data_file.write_bytes(b'{"schema_version": 2, "dates": ["2026-08-0\x80"]}')
+    with pytest.raises(RecordsFileCorruptedError):
+        load_dates(data_file=data_file)
+
+
+def test_load_dates_raises_when_date_element_is_not_a_string(tmp_path):
+    data_file = tmp_path / "records.json"
+    data_file.write_text(
+        json.dumps({"schema_version": 2, "dates": [20260801]}), encoding="utf-8"
+    )
+    with pytest.raises(RecordsFileCorruptedError):
+        load_dates(data_file=data_file)
+
+
+def test_load_dates_raises_when_top_level_is_neither_list_nor_dict(tmp_path):
+    data_file = tmp_path / "records.json"
+    data_file.write_text(json.dumps("just a string"), encoding="utf-8")
+    with pytest.raises(RecordsFileCorruptedError):
+        load_dates(data_file=data_file)
+
+
+def test_restore_data_raises_on_invalid_utf8_backup_and_leaves_data_file_unchanged(
+    tmp_path,
+):
+    data_file = tmp_path / "records.json"
+    save_dates({"2026-08-01"}, data_file=data_file)
+    original_bytes = data_file.read_bytes()
+
+    bad_backup = tmp_path / "bad_backup.json"
+    bad_backup.write_bytes(b'{"schema_version": 2, "dates": ["2026-08-0\x80"]}')
+
+    with pytest.raises(RecordsFileCorruptedError):
+        restore_data(bad_backup, data_file=data_file)
+
+    assert data_file.read_bytes() == original_bytes
+
+
+def test_restore_data_leaves_data_file_unchanged_when_atomic_replace_fails(
+    tmp_path, monkeypatch
+):
+    data_file = tmp_path / "records.json"
+    backup_dir = tmp_path / "backups"
+    save_dates({"2026-08-01"}, data_file=data_file, backup_dir=backup_dir)
+    save_dates({"2026-08-01", "2026-08-02"}, data_file=data_file, backup_dir=backup_dir)
+    original_bytes = data_file.read_bytes()
+
+    target_backup = list_backups(data_file=data_file, backup_dir=backup_dir)[-1]
+
+    def boom(*args, **kwargs):
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(logic.os, "replace", boom)
+
+    with pytest.raises(OSError):
+        restore_data(target_backup, data_file=data_file, backup_dir=backup_dir)
+
+    assert data_file.read_bytes() == original_bytes
+    assert list(data_file.parent.glob("*.tmp")) == []
+
+
+def test_save_dates_refuses_to_overwrite_corrupted_existing_file(tmp_path):
+    data_file = tmp_path / "records.json"
+    data_file.write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(RecordsFileCorruptedError):
+        save_dates({"2026-08-01"}, data_file=data_file)
+
+    # 上書きされていない(壊れた内容のまま)
+    assert data_file.read_text(encoding="utf-8") == "{not valid json"
+
+
+def test_save_dates_backs_up_corrupted_existing_file_as_raw_bytes_before_refusing(
+    tmp_path,
+):
+    data_file = tmp_path / "records.json"
+    backup_dir = tmp_path / "backups"
+    corrupted_bytes = b'{"schema_version": 2, "dates": ["2026-08-0\x80"]}'
+    data_file.write_bytes(corrupted_bytes)
+
+    with pytest.raises(RecordsFileCorruptedError):
+        save_dates({"2026-08-01"}, data_file=data_file, backup_dir=backup_dir)
+
+    backups = list_backups(data_file=data_file, backup_dir=backup_dir)
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == corrupted_bytes  # 生バイトのまま退避されている
+
+
+def test_atomic_write_uses_unique_temp_file_names_across_multiple_calls(
+    tmp_path, monkeypatch
+):
+    data_file = tmp_path / "records.json"
+    seen_names = []
+    real_mkstemp = tempfile.mkstemp
+
+    def spy_mkstemp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        seen_names.append(name)
+        return fd, name
+
+    monkeypatch.setattr(logic.tempfile, "mkstemp", spy_mkstemp)
+
+    save_dates({"2026-08-01"}, data_file=data_file)
+    save_dates({"2026-08-01", "2026-08-02"}, data_file=data_file)
+    save_dates({"2026-08-01", "2026-08-02", "2026-08-03"}, data_file=data_file)
+
+    assert len(seen_names) >= 3
+    assert len(set(seen_names)) == len(seen_names)  # 呼び出しごとに一意
