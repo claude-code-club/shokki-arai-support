@@ -6,13 +6,17 @@ import streamlit as st
 from encourage import get_encouragement
 from illustrations import get_month_svg
 from logic import (
-    RecordsFileCorruptedError,
     build_month_progress,
     calc_best_streak,
     calc_current_streak,
+    today_jst,
+)
+from storage import (
+    RecordsFileCorruptedError,
+    StorageConfigError,
+    StorageUnavailableError,
     load_dates,
     save_dates,
-    today_jst,
 )
 
 # 東京の座標。Open-Meteo は無料・APIキー不要の天気API。
@@ -89,7 +93,29 @@ except RecordsFileCorruptedError:
         "(復元手順は仕様書/本番DB運用.mdを参照)。"
     )
     st.stop()
+except (StorageConfigError, StorageUnavailableError):
+    # 接続情報や内部エラーの詳細は画面に出さず、一般向けの安全なメッセージのみ表示する。
+    st.error(
+        "記録データの保存先に問題が発生しているため、安全のため表示・保存処理を停止しました。"
+        "しばらくしてから再度お試しいただくか、管理者に連絡してください。"
+    )
+    st.stop()
 today_str = today_jst().isoformat()
+
+
+def save_dates_safely(dates):
+    """記録保存時のStorageConfigError/StorageUnavailableErrorを、初回読み込み時と
+    同じ一般向けの安全なメッセージで捕捉し、st.stop()する(内部エラーの詳細は画面に出さない)。
+    """
+    try:
+        save_dates(dates)
+    except (StorageConfigError, StorageUnavailableError):
+        st.error(
+            "記録の保存中に問題が発生しました。安全のため処理を停止しました。"
+            "しばらくしてから再度お試しいただくか、管理者に連絡してください。"
+        )
+        st.stop()
+
 
 @st.cache_data(ttl=3600)
 def cached_encouragement(streak, best_streak, day_key):
@@ -106,12 +132,12 @@ if today_str in dates:
         st.info(comment)
     if st.button("今日の記録を取り消す"):
         dates.discard(today_str)
-        save_dates(dates)
+        save_dates_safely(dates)
         st.rerun()
 else:
     if st.button("今日、洗いました！"):
         dates.add(today_str)
-        save_dates(dates)
+        save_dates_safely(dates)
         st.rerun()
 
 st.divider()

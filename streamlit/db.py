@@ -1,7 +1,13 @@
 """PostgreSQL版の記録データ読み書き。
 
-logic.py（JSON版）と並行して存在し、DATABASE_URLが設定されている場合のみ使う。
-まだapp.pyからは呼び出していない（切り替えは別ステップで行う）。
+logic.py（JSON版）と並行して存在し、storage.py（保存方式の切り替え窓口）から使う。
+
+このモジュールはSQL操作のみを行い、commit・rollbackは一切呼ばない。
+トランザクションの確定・取消は必ず呼び出し元（storage.pyや
+scripts/migrate_to_postgres.py）が行う（仕様書/保存方式切り替え設計.md ②-b参照）。
+理由: 移行スクリプトで「書き込み→照合」を1つのトランザクションにまとめ、照合が
+一致した場合だけ確定できるようにするため。db.py自身が書き込み直後にcommitして
+しまうと、後続の照合で不一致が見つかっても書き込みが先に確定してしまう。
 """
 
 import os
@@ -29,7 +35,7 @@ def get_connection():
 
 
 def ensure_schema(conn):
-    """recordsテーブルが無ければ作成する。何度呼んでも安全(IF NOT EXISTS)。"""
+    """recordsテーブルが無ければ作成する(SQL操作のみ、commitしない)。何度呼んでも安全(IF NOT EXISTS)。"""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -46,7 +52,6 @@ def ensure_schema(conn):
             ON records (record_date)
             """
         )
-    conn.commit()
 
 
 def load_dates(conn):
@@ -57,7 +62,7 @@ def load_dates(conn):
 
 
 def insert_dates(dates, conn):
-    """与えた日付集合を追加する(削除は行わない、追加専用)。
+    """与えた日付集合を追加する(削除は行わない、追加専用。SQL操作のみ)。
 
     record_dateのUNIQUE制約とON CONFLICT DO NOTHINGにより、
     既に存在する日付を渡しても何度でも安全に再実行できる(冪等)。
@@ -68,11 +73,10 @@ def insert_dates(dates, conn):
             "INSERT INTO records (record_date) VALUES (%s) ON CONFLICT (record_date) DO NOTHING",
             [(d,) for d in sorted(dates)],
         )
-    conn.commit()
 
 
 def save_dates(dates, conn):
-    """記録日の集合を、渡された内容と完全に一致するよう置き換える(追加・削除の両方を行う)。
+    """記録日の集合を、渡された内容と完全に一致するよう置き換える(SQL操作のみ)。
 
     logic.save_dates()と同じ「全体を置き換える」呼び出し方に合わせた関数。
     削除も行うため、移行スクリプトでは使わずinsert_dates()を使うこと。
@@ -93,7 +97,6 @@ def save_dates(dates, conn):
                 "INSERT INTO records (record_date) VALUES (%s) ON CONFLICT (record_date) DO NOTHING",
                 [(d,) for d in to_add],
             )
-    conn.commit()
 
 
 def compare_date_sets(json_dates, db_dates):
