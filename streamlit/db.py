@@ -1,0 +1,111 @@
+"""PostgreSQL版の記録データ読み書き。
+
+logic.py（JSON版）と並行して存在し、DATABASE_URLが設定されている場合のみ使う。
+まだapp.pyからは呼び出していない（切り替えは別ステップで行う）。
+"""
+
+import os
+
+import psycopg
+
+DATABASE_URL_ENV = "DATABASE_URL"
+
+
+class DatabaseNotConfiguredError(Exception):
+    """DATABASE_URL環境変数が設定されていない場合に送出される。"""
+
+
+def is_configured():
+    return bool(os.environ.get(DATABASE_URL_ENV))
+
+
+def get_connection():
+    url = os.environ.get(DATABASE_URL_ENV)
+    if not url:
+        raise DatabaseNotConfiguredError(
+            f"{DATABASE_URL_ENV}が設定されていません。PostgreSQLへは接続できません。"
+        )
+    return psycopg.connect(url)
+
+
+def ensure_schema(conn):
+    """recordsテーブルが無ければ作成する。何度呼んでも安全(IF NOT EXISTS)。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS records (
+                id          BIGSERIAL PRIMARY KEY,
+                record_date DATE NOT NULL,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS records_record_date_unique
+            ON records (record_date)
+            """
+        )
+    conn.commit()
+
+
+def load_dates(conn):
+    """記録日の集合を返す(ISO日付文字列)。"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT record_date FROM records")
+        return {row[0].isoformat() for row in cur.fetchall()}
+
+
+def insert_dates(dates, conn):
+    """与えた日付集合を追加する(削除は行わない、追加専用)。
+
+    record_dateのUNIQUE制約とON CONFLICT DO NOTHINGにより、
+    既に存在する日付を渡しても何度でも安全に再実行できる(冪等)。
+    移行スクリプト(migrate_to_postgres.py)から使う。
+    """
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO records (record_date) VALUES (%s) ON CONFLICT (record_date) DO NOTHING",
+            [(d,) for d in sorted(dates)],
+        )
+    conn.commit()
+
+
+def save_dates(dates, conn):
+    """記録日の集合を、渡された内容と完全に一致するよう置き換える(追加・削除の両方を行う)。
+
+    logic.save_dates()と同じ「全体を置き換える」呼び出し方に合わせた関数。
+    削除も行うため、移行スクリプトでは使わずinsert_dates()を使うこと。
+    """
+    dates = set(dates)
+    existing = load_dates(conn)
+    to_delete = sorted(existing - dates)
+    to_add = sorted(dates - existing)
+
+    with conn.cursor() as cur:
+        if to_delete:
+            cur.execute(
+                "DELETE FROM records WHERE record_date = ANY(%s::date[])",
+                (to_delete,),
+            )
+        if to_add:
+            cur.executemany(
+                "INSERT INTO records (record_date) VALUES (%s) ON CONFLICT (record_date) DO NOTHING",
+                [(d,) for d in to_add],
+            )
+    conn.commit()
+
+
+def compare_date_sets(json_dates, db_dates):
+    """2つの日付集合(set[str])を比較し、完全一致するかと差分を返す。
+
+    DB接続を必要としない純粋関数(ダミーデータだけでテストできる)。
+    移行前後の検証(件数だけでなく中身の完全一致)に使う。
+    """
+    json_dates = set(json_dates)
+    db_dates = set(db_dates)
+    return {
+        "match": json_dates == db_dates,
+        "only_in_json": sorted(json_dates - db_dates),
+        "only_in_db": sorted(db_dates - json_dates),
+    }

@@ -1,3 +1,4 @@
 streamlit
 requests
 anthropic
+psycopg[binary]
