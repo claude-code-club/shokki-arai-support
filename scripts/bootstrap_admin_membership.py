@@ -21,9 +21,9 @@ import db  # noqa: E402
 
 
 def bootstrap_admin_membership(
-    auth_subject, tenant_id, conn=None, email=None, email_verified=False
+    auth_subject, tenant_id, conn=None, email=None, email_verified=False, role="admin"
 ):
-    """指定したauth_subjectのユーザーを、指定したtenant_idへadminとして紐付ける。
+    """指定したauth_subjectのユーザーを、指定したtenant_idへ紐付ける(既定はadmin)。
 
     tenant_idが存在しない場合はValueErrorを送出する(誤ったtenant_idで新規に
     孤立したmembershipを作らないため)。戻り値はuser_id。
@@ -32,6 +32,8 @@ def bootstrap_admin_membership(
         raise TypeError("auth_subjectは空でない文字列で渡してください。")
     if not isinstance(tenant_id, uuid.UUID):
         raise TypeError("tenant_idはuuid.UUIDのインスタンスで渡してください。")
+    if role not in ("admin", "member"):
+        raise ValueError(f"roleは'admin'または'member'で渡してください: {role!r}")
 
     owns_conn = conn is None
     conn = conn or db.get_connection()
@@ -44,7 +46,7 @@ def bootstrap_admin_membership(
         user_id = db.get_or_create_user(
             conn, auth_subject=auth_subject, email=email, email_verified=email_verified
         )
-        db.create_membership(conn, tenant_id=tenant_id, user_id=user_id, role="admin")
+        db.create_membership(conn, tenant_id=tenant_id, user_id=user_id, role=role)
         conn.commit()
         return user_id
     except psycopg.Error:
@@ -56,9 +58,10 @@ def bootstrap_admin_membership(
 
 
 def main(argv):
-    if len(argv) != 3:
+    if len(argv) not in (3, 4):
         print(
-            "使い方: python scripts/bootstrap_admin_membership.py <auth_subject> <tenant_idのUUID>"
+            "使い方: python scripts/bootstrap_admin_membership.py "
+            "<auth_subject> <tenant_idのUUID> [role: admin|member]"
         )
         return 1
 
@@ -68,10 +71,11 @@ def main(argv):
     except ValueError:
         print(f"[NG] tenant_idがUUID形式ではありません: {argv[2]!r}")
         return 1
+    role = argv[3] if len(argv) == 4 else "admin"
 
     try:
-        user_id = bootstrap_admin_membership(auth_subject, tenant_id)
-    except ValueError as e:
+        user_id = bootstrap_admin_membership(auth_subject, tenant_id, role=role)
+    except (ValueError, TypeError) as e:
         print(f"[NG] {e}")
         return 1
     except db.DatabaseNotConfiguredError as e:
@@ -81,7 +85,7 @@ def main(argv):
         print("[NG] PostgreSQLへの接続または操作に失敗しました。")
         return 1
 
-    print(f"[OK] adminとして紐付けました。user_id={user_id}")
+    print(f"[OK] {role}として紐付けました。user_id={user_id}")
     return 0
 
 
