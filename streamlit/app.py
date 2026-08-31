@@ -1,4 +1,5 @@
 import base64
+import os
 
 import requests
 import streamlit as st
@@ -12,6 +13,7 @@ from logic import (
     today_jst,
 )
 import auth
+import billing
 from storage import (
     RecordsFileCorruptedError,
     StorageConfigError,
@@ -108,6 +110,65 @@ if auth.is_auth_enabled():
         st.stop()
 else:
     TENANT_ID = get_tenant_id()
+
+if auth.is_auth_enabled() and billing.is_billing_enabled():
+    st.divider()
+    st.subheader("プラン")
+
+    query_params = st.query_params
+    if "session_id" in query_params:
+        session_id = query_params.get("session_id")
+        try:
+            billing.apply_checkout_session(
+                session_id=session_id, tenant_id=TENANT_ID, role=USER_ROLE
+            )
+            st.success("お支払いが完了し、Standardプランへ変更されました。")
+        except billing.PermissionDeniedError:
+            st.error("この操作にはadmin権限が必要です。")
+        except (billing.InvalidSessionError, billing.TenantMismatchError):
+            st.error("お支払い状況を確認できませんでした。お手数ですが再度お試しください。")
+        except (billing.StripeApiError, billing.BillingUnavailableError, billing.BillingConfigError):
+            st.error(
+                "お支払い状況の確認中に問題が発生しました。"
+                "しばらくしてから再度お試しいただくか、管理者に連絡してください。"
+            )
+        st.query_params.clear()
+    elif query_params.get("billing") == "cancelled":
+        st.info("お支払いをキャンセルしました。プランはFreeのままです。")
+        st.query_params.clear()
+
+    try:
+        plan_status = billing.fetch_plan_status(TENANT_ID)
+    except (billing.BillingUnavailableError, billing.BillingConfigError):
+        plan_status = None
+        st.caption("プラン情報を取得できませんでした。")
+
+    if plan_status is not None:
+        is_standard = plan_status["plan"] == "standard"
+        st.write(f"現在のプラン: **{'Standard（月額500円）' if is_standard else 'Free'}**")
+        st.caption("Free：0円 ／ Standard：月額500円（テストモードでの仮価格）")
+
+        if not is_standard and USER_ROLE == "admin":
+            if st.button("Standardを購入する（テスト決済）"):
+                base_url = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+                try:
+                    checkout_session = billing.start_checkout_session(
+                        tenant_id=TENANT_ID,
+                        role=USER_ROLE,
+                        success_url=f"{base_url}/?session_id={{CHECKOUT_SESSION_ID}}",
+                        cancel_url=f"{base_url}/?billing=cancelled",
+                    )
+                    st.session_state["_checkout_url"] = checkout_session.url
+                except billing.PermissionDeniedError:
+                    st.error("この操作にはadmin権限が必要です。")
+                except billing.BillingConfigError:
+                    st.error("課金機能が正しく設定されていません。管理者に連絡してください。")
+                except billing.StripeApiError:
+                    st.error("Stripeとの通信に失敗しました。しばらくしてから再度お試しください。")
+
+            checkout_url = st.session_state.get("_checkout_url")
+            if checkout_url:
+                st.link_button("お支払いへ進む（Stripeのページへ移動します）", checkout_url)
 
 try:
     dates = load_dates(tenant_id=TENANT_ID)
