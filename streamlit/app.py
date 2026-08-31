@@ -91,6 +91,10 @@ except (requests.RequestException, KeyError, ValueError):
 USER_ROLE = None
 
 if auth.is_auth_enabled():
+    if st.user.is_logged_in:
+        # ログイン済みなら、世帯所属の解決結果によらず常にログアウトできるようにする
+        # (確認待ち・未所属の画面で行き詰まらないようにするため)。
+        st.sidebar.button("ログアウト", on_click=st.logout)
     try:
         TENANT_ID, USER_ROLE = auth.require_login_and_resolve_tenant()
     except auth.EmailNotVerifiedError:
@@ -102,7 +106,6 @@ if auth.is_auth_enabled():
     if TENANT_ID is None:
         # 未ログイン。require_login_and_resolve_tenant()が既にログイン導線を表示済み。
         st.stop()
-    st.sidebar.button("ログアウト", on_click=st.logout)
 else:
     TENANT_ID = get_tenant_id()
 
