@@ -15,8 +15,10 @@ from storage import (
     RecordsFileCorruptedError,
     StorageConfigError,
     StorageUnavailableError,
+    add_date,
+    cancel_date,
+    get_tenant_id,
     load_dates,
-    save_dates,
 )
 
 # 東京の座標。Open-Meteo は無料・APIキー不要の天気API。
@@ -85,7 +87,8 @@ except (requests.RequestException, KeyError, ValueError):
     st.caption("（今日の天気は取得できませんでした）")
 
 try:
-    dates = load_dates()
+    TENANT_ID = get_tenant_id()
+    dates = load_dates(tenant_id=TENANT_ID)
 except RecordsFileCorruptedError:
     st.error(
         "記録データ(records.json)の読み込みに失敗しました。ファイルが壊れている可能性があるため、"
@@ -103,15 +106,29 @@ except (StorageConfigError, StorageUnavailableError):
 today_str = today_jst().isoformat()
 
 
-def save_dates_safely(dates):
+def add_date_safely(record_date):
     """記録保存時のStorageConfigError/StorageUnavailableErrorを、初回読み込み時と
     同じ一般向けの安全なメッセージで捕捉し、st.stop()する(内部エラーの詳細は画面に出さない)。
     """
     try:
-        save_dates(dates)
+        add_date(record_date, tenant_id=TENANT_ID)
     except (StorageConfigError, StorageUnavailableError):
         st.error(
             "記録の保存中に問題が発生しました。安全のため処理を停止しました。"
+            "しばらくしてから再度お試しいただくか、管理者に連絡してください。"
+        )
+        st.stop()
+
+
+def cancel_date_safely(record_date):
+    """記録取り消し時のStorageConfigError/StorageUnavailableErrorを、add_date_safely()と
+    同じ一般向けの安全なメッセージで捕捉し、st.stop()する。
+    """
+    try:
+        cancel_date(record_date, tenant_id=TENANT_ID)
+    except (StorageConfigError, StorageUnavailableError):
+        st.error(
+            "記録の取り消し中に問題が発生しました。安全のため処理を停止しました。"
             "しばらくしてから再度お試しいただくか、管理者に連絡してください。"
         )
         st.stop()
@@ -131,13 +148,11 @@ if today_str in dates:
     if comment:
         st.info(comment)
     if st.button("今日の記録を取り消す"):
-        dates.discard(today_str)
-        save_dates_safely(dates)
+        cancel_date_safely(today_str)
         st.rerun()
 else:
     if st.button("今日、洗いました！"):
-        dates.add(today_str)
-        save_dates_safely(dates)
+        add_date_safely(today_str)
         st.rerun()
 
 st.divider()

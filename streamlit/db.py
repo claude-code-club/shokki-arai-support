@@ -8,6 +8,13 @@ scripts/migrate_to_postgres.py）が行う（仕様書/保存方式切り替え�
 理由: 移行スクリプトで「書き込み→照合」を1つのトランザクションにまとめ、照合が
 一致した場合だけ確定できるようにするため。db.py自身が書き込み直後にcommitして
 しまうと、後続の照合で不一致が見つかっても書き込みが先に確定してしまう。
+
+第16回（マルチテナント設計）以降、通常のアプリ操作（storage.py経由）は
+_for_tenantが付いた関数（tenant_id必須のキーワード専用引数）を使う。
+ensure_schema()・load_dates()・insert_dates()・save_dates()（tenant_id無し）は、
+tenant_id列を追加する前の一度きりの移行（scripts/migrate_to_postgres.py・
+scripts/migrate_to_tenant_schema.py）専用に残しており、テナント対応スキーマが
+既に存在する環境の通常操作では使わない（仕様書/マルチテナント設計.md⑤参照）。
 """
 
 import os
@@ -96,6 +103,75 @@ def save_dates(dates, conn):
             cur.executemany(
                 "INSERT INTO records (record_date) VALUES (%s) ON CONFLICT (record_date) DO NOTHING",
                 [(d,) for d in to_add],
+            )
+
+
+def load_dates_for_tenant(conn, *, tenant_id):
+    """指定したtenant_idの記録日集合を返す(SQL操作のみ、commitしない)。
+
+    tenant_idはデフォルト値なしのキーワード専用引数(呼び忘れるとTypeErrorになる。
+    仕様書/マルチテナント設計.md⑤参照)。第16回以降、storage.py経由の通常操作は
+    すべてこちらを使う。ensure_schema()と違い、テナント対応スキーマ(migrate_to_
+    tenant_schema.py実行後)が既に存在する前提で、スキーマの作成・変更は行わない。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT record_date FROM records WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        return {row[0].isoformat() for row in cur.fetchall()}
+
+
+def insert_date_for_tenant(record_date, conn, *, tenant_id):
+    """指定したtenant_idへ、1件の記録日だけを原子的に追加する(SQL操作のみ)。
+
+    UNIQUE(tenant_id, record_date)とON CONFLICT DO NOTHINGにより、
+    既に存在する場合は無視される(冪等)。日付集合全体を読み込んで置き換える
+    save_dates_for_tenant()と違い、他の記録に一切触れないため、同じ世帯の
+    複数端末からのほぼ同時操作でもロスト・アップデートが起きにくい
+    (仕様書/マルチテナント設計.md⑩参照)。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO records (tenant_id, record_date) VALUES (%s, %s) "
+            "ON CONFLICT (tenant_id, record_date) DO NOTHING",
+            (tenant_id, record_date),
+        )
+
+
+def delete_date_for_tenant(record_date, conn, *, tenant_id):
+    """指定したtenant_idから、1件の記録日だけを原子的に削除する(SQL操作のみ)。
+
+    tenant_idとrecord_dateの両方をWHERE条件にするため、他テナントの同じ日付や、
+    指定と異なるテナントの行には一切影響しない。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM records WHERE tenant_id = %s AND record_date = %s",
+            (tenant_id, record_date),
+        )
+
+
+def save_dates_for_tenant(dates, conn, *, tenant_id):
+    """指定したtenant_id配下の記録日集合だけを、渡された内容と完全に一致するよう
+    置き換える(SQL操作のみ)。他テナントの行には一切触れない。
+    """
+    dates = set(dates)
+    existing = load_dates_for_tenant(conn, tenant_id=tenant_id)
+    to_delete = sorted(existing - dates)
+    to_add = sorted(dates - existing)
+
+    with conn.cursor() as cur:
+        if to_delete:
+            cur.execute(
+                "DELETE FROM records WHERE tenant_id = %s AND record_date = ANY(%s::date[])",
+                (tenant_id, to_delete),
+            )
+        if to_add:
+            cur.executemany(
+                "INSERT INTO records (tenant_id, record_date) VALUES (%s, %s) "
+                "ON CONFLICT (tenant_id, record_date) DO NOTHING",
+                [(tenant_id, d) for d in to_add],
             )
 
 
