@@ -1,3 +1,4 @@
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -44,10 +45,16 @@ def tenant_env(monkeypatch):
     if not db.is_configured():
         pytest.skip("DATABASE_URLが設定されていないため、PostgreSQL連携テストをスキップします")
 
-    schema_name = f"test_storage_{uuid.uuid4().hex}"
-    real_get_connection = db.get_connection
+    # テスト本体がDATABASE_URLをmonkeypatchで書き換えるケース(接続失敗の疑似)があるため、
+    # 後始末は「今」の環境変数ではなく、フィクスチャ開始時点の正しい接続先を使う。
+    good_database_url = os.environ["DATABASE_URL"]
 
-    setup_conn = real_get_connection()
+    def _connect_with_good_url():
+        return psycopg.connect(good_database_url)
+
+    schema_name = f"test_storage_{uuid.uuid4().hex}"
+
+    setup_conn = _connect_with_good_url()
     with setup_conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA {schema_name}")
         cur.execute(f"SET search_path TO {schema_name}")
@@ -55,6 +62,8 @@ def tenant_env(monkeypatch):
     tenant_id = uuid.uuid4()
     migrate_tenant_module.migrate_to_tenant_schema(tenant_id, conn=setup_conn)
     setup_conn.close()
+
+    real_get_connection = db.get_connection  # テスト中の実際の接続はこちら経由(監視対象)
 
     def patched_get_connection():
         conn = real_get_connection()
@@ -69,7 +78,7 @@ def tenant_env(monkeypatch):
     try:
         yield tenant_id
     finally:
-        cleanup_conn = real_get_connection()
+        cleanup_conn = _connect_with_good_url()
         try:
             with cleanup_conn.cursor() as cur:
                 cur.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE")
