@@ -245,3 +245,72 @@ def update_tenant_name(conn, *, tenant_id, name):
     """世帯名を変更する(SQL操作のみ)。呼び出し元がrole検証を行うこと(admin専用操作)。"""
     with conn.cursor() as cur:
         cur.execute("UPDATE tenants SET name = %s WHERE id = %s", (name, tenant_id))
+
+
+# --- 第18回(課金①: Stripeサブスク決済): tenant_subscriptions(SQL操作のみ、commitしない) ---
+
+
+def get_subscription(conn, *, tenant_id):
+    """指定世帯の課金状態を返す。行が無ければfree扱いの既定値を返す(行を作らない)。
+
+    戻り値: {"plan", "status", "current_period_end"}の辞書。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT plan, status, current_period_end FROM tenant_subscriptions "
+            "WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return {"plan": "free", "status": "active", "current_period_end": None}
+    return {"plan": row[0], "status": row[1], "current_period_end": row[2]}
+
+
+def upsert_subscription_if_new_session(
+    conn,
+    *,
+    tenant_id,
+    plan,
+    status,
+    stripe_customer_id,
+    stripe_subscription_id,
+    stripe_checkout_session_id,
+    current_period_end,
+):
+    """世帯の課金状態をStandardへ反映する(冪等: 同じstripe_checkout_session_idなら何もしない)。
+
+    stripe_checkout_session_idにUNIQUE制約があるため、既に別世帯の行で使われている
+    session_idを渡した場合はpsycopg.IntegrityErrorを送出する(呼び出し元がrollbackすること)。
+    戻り値: 実際に反映した場合True、既に同じsession_idで反映済みだった場合False。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO tenant_subscriptions
+                (tenant_id, plan, status, stripe_customer_id, stripe_subscription_id,
+                 stripe_checkout_session_id, current_period_end, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (tenant_id) DO UPDATE SET
+                plan = EXCLUDED.plan,
+                status = EXCLUDED.status,
+                stripe_customer_id = EXCLUDED.stripe_customer_id,
+                stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+                stripe_checkout_session_id = EXCLUDED.stripe_checkout_session_id,
+                current_period_end = EXCLUDED.current_period_end,
+                updated_at = now()
+            WHERE tenant_subscriptions.stripe_checkout_session_id
+                IS DISTINCT FROM EXCLUDED.stripe_checkout_session_id
+            RETURNING tenant_id
+            """,
+            (
+                tenant_id,
+                plan,
+                status,
+                stripe_customer_id,
+                stripe_subscription_id,
+                stripe_checkout_session_id,
+                current_period_end,
+            ),
+        )
+        return cur.fetchone() is not None

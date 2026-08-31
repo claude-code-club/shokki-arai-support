@@ -1,0 +1,211 @@
+"""Stripeを使った世帯単位のサブスクリプション課金窓口。
+
+第18回(課金①: Stripeサブスク決済)。Stripeがカード情報・顧客・サブスクリプションの
+契約状態そのものを保持し(真実の源)、アプリDBは表示・アクセス制御用のキャッシュ
+(現在のプラン・状態・Stripe側IDへの参照)だけを持つ(仕様書/Stripe課金設計.md③参照)。
+
+BILLING_ENABLED(既定は未設定=無効)がtrueの場合のみ課金UI・課金フローが有効になる
+(仕様書/Stripe課金設計.md⑧参照)。
+
+Checkout Sessionは必ずサーバー側(このモジュール)で作成・検証する。success_urlへ
+戻ってきたことの表示だけでStandardへ変更することは一切行わない。session_idを使って
+Stripe APIからCheckout Sessionを取得し直し、mode・状態・metadataのtenant_id一致を
+サーバー側で検証してから、初めてDBへ反映する(仕様書/Stripe課金設計.md⑤参照)。
+
+Stripe通信はstripe_client引数として注入可能にしており(省略時のみ実際のstripeパッケージを
+使う)、実際のStripe接続なしでテストできる(仕様書/Stripe課金設計.md⑦参照)。
+"""
+
+import os
+from datetime import datetime, timezone
+
+import psycopg
+
+import db
+
+BILLING_ENABLED_ENV = "BILLING_ENABLED"
+STRIPE_SECRET_KEY_ENV = "STRIPE_SECRET_KEY"
+STRIPE_PRICE_ID_STANDARD_ENV = "STRIPE_PRICE_ID_STANDARD"
+
+_ACTIVE_SUBSCRIPTION_STATUSES = ("active", "trialing")
+
+
+class BillingConfigError(Exception):
+    """BILLING_ENABLED=trueなのに必要な環境変数(秘密鍵・Price ID)が未設定の場合。"""
+
+
+class PermissionDeniedError(Exception):
+    """admin以外が世帯プランの購入・変更操作を行おうとした場合。"""
+
+
+class InvalidSessionError(Exception):
+    """Checkout Sessionのmode・状態が不正で、Standardへ反映できない場合。
+
+    未払い・subscriptionモードでない・状態が有効でない等、すべてこの例外にまとめる
+    (success_urlの表示だけを信用しないための検証。仕様書/Stripe課金設計.md⑤参照)。
+    """
+
+
+class TenantMismatchError(Exception):
+    """Checkout Sessionのmetadataのtenant_idが、現在ログイン中の世帯と一致しない場合。"""
+
+
+class StripeApiError(Exception):
+    """Stripe API呼び出し自体が失敗した場合(ネットワークエラー等)。DBには一切書き込まない。"""
+
+
+class BillingUnavailableError(Exception):
+    """PostgreSQLへの接続・読み書きに失敗した場合。"""
+
+
+def is_billing_enabled():
+    return os.environ.get(BILLING_ENABLED_ENV, "").strip().lower() == "true"
+
+
+def _get_stripe_client():
+    """実際のstripeパッケージをSTRIPE_SECRET_KEYで初期化して返す(テスト以外の既定経路)。"""
+    api_key = os.environ.get(STRIPE_SECRET_KEY_ENV, "").strip()
+    if not api_key:
+        raise BillingConfigError(f"{STRIPE_SECRET_KEY_ENV}が設定されていません。")
+    import stripe  # 遅延import(BILLING_ENABLED=false環境ではstripeパッケージ未使用のため)
+
+    stripe.api_key = api_key
+    return stripe
+
+
+def _get_price_id():
+    price_id = os.environ.get(STRIPE_PRICE_ID_STANDARD_ENV, "").strip()
+    if not price_id:
+        raise BillingConfigError(f"{STRIPE_PRICE_ID_STANDARD_ENV}が設定されていません。")
+    return price_id
+
+
+def get_plan_status(conn, *, tenant_id):
+    """指定世帯の現在のプラン状態を返す({"plan", "status", "current_period_end"})。"""
+    return db.get_subscription(conn, tenant_id=tenant_id)
+
+
+def create_checkout_session(*, tenant_id, role, success_url, cancel_url, stripe_client=None):
+    """Standardプランの契約用Checkout Sessionをサーバー側で作成する(admin専用)。
+
+    tenant_id・roleは呼び出し側(app.py)がログインセッションから確定済みの値を渡すこと
+    (ブラウザ入力・URLパラメータからは一切受け取らない)。
+    """
+    if role != "admin":
+        raise PermissionDeniedError("世帯プランの購入にはadmin権限が必要です。")
+
+    stripe_client = stripe_client or _get_stripe_client()
+    price_id = _get_price_id()
+
+    try:
+        return stripe_client.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={"tenant_id": str(tenant_id)},
+        )
+    except (BillingConfigError, PermissionDeniedError):
+        raise
+    except Exception as e:
+        raise StripeApiError("Stripeとの通信に失敗しました。") from e
+
+
+def confirm_checkout_session(*, session_id, tenant_id, role, conn, stripe_client=None):
+    """session_idをStripe APIで取得し直し、検証を通過した場合のみStandardへ反映する。
+
+    - roleがadminでない場合: PermissionDeniedError(DB未接続、Stripe未呼び出し)
+    - 取得したSessionのmodeがsubscriptionでない、状態が有効でない場合: InvalidSessionError
+    - metadataのtenant_idが現在の世帯と一致しない場合: TenantMismatchError
+    - 上記いずれの場合もDBへは一切書き込まない(Freeのまま)。
+    """
+    if role != "admin":
+        raise PermissionDeniedError("世帯プランの購入にはadmin権限が必要です。")
+
+    stripe_client = stripe_client or _get_stripe_client()
+    try:
+        session = stripe_client.checkout.Session.retrieve(session_id, expand=["subscription"])
+    except (BillingConfigError, PermissionDeniedError):
+        raise
+    except Exception as e:
+        raise StripeApiError("Stripeとの通信に失敗しました。") from e
+
+    if session.get("mode") != "subscription":
+        raise InvalidSessionError("このCheckout Sessionはsubscriptionモードではありません。")
+
+    subscription = session.get("subscription")
+    subscription_status = subscription.get("status") if subscription else None
+    if session.get("status") != "complete" or subscription_status not in _ACTIVE_SUBSCRIPTION_STATUSES:
+        raise InvalidSessionError("決済または契約状態が有効ではありません。")
+
+    metadata = session.get("metadata") or {}
+    if metadata.get("tenant_id") != str(tenant_id):
+        raise TenantMismatchError("Checkout Sessionの世帯情報が一致しません。")
+
+    period_end_ts = subscription.get("current_period_end") if subscription else None
+    current_period_end = (
+        datetime.fromtimestamp(period_end_ts, tz=timezone.utc) if period_end_ts else None
+    )
+
+    try:
+        applied = db.upsert_subscription_if_new_session(
+            conn,
+            tenant_id=tenant_id,
+            plan="standard",
+            status=subscription_status,
+            stripe_customer_id=session.get("customer"),
+            stripe_subscription_id=subscription.get("id") if subscription else None,
+            stripe_checkout_session_id=session.get("id"),
+            current_period_end=current_period_end,
+        )
+        conn.commit()
+    except psycopg.Error:
+        conn.rollback()
+        raise
+
+    return applied
+
+
+# --- app.pyから使う、DB接続を自前で管理するラッパー(storage.pyと同じ方針) ---
+
+
+def _get_postgres_connection():
+    try:
+        return db.get_connection()
+    except db.DatabaseNotConfiguredError as e:
+        raise BillingConfigError(str(e)) from e
+    except psycopg.Error as e:
+        raise BillingUnavailableError("PostgreSQLへの接続に失敗しました。") from e
+
+
+def fetch_plan_status(tenant_id):
+    """app.pyから呼ぶ入口。指定世帯の現在のプラン状態を返す(接続は自前で開閉する)。"""
+    conn = _get_postgres_connection()
+    try:
+        return get_plan_status(conn, tenant_id=tenant_id)
+    except psycopg.Error as e:
+        raise BillingUnavailableError("課金状態の取得に失敗しました。") from e
+    finally:
+        conn.close()
+
+
+def start_checkout_session(*, tenant_id, role, success_url, cancel_url):
+    """app.pyから呼ぶ入口。Checkout Sessionを作成し、遷移先URLを返す(DB接続は使わない)。"""
+    return create_checkout_session(
+        tenant_id=tenant_id, role=role, success_url=success_url, cancel_url=cancel_url
+    )
+
+
+def apply_checkout_session(*, session_id, tenant_id, role):
+    """app.pyから呼ぶ入口。success_urlへ戻ってきたsession_idをサーバー側で検証・反映する。
+
+    (接続は自前で開閉する。PermissionDeniedError・InvalidSessionError・
+    TenantMismatchError・StripeApiError・BillingConfigErrorはそのまま伝播する)。
+    """
+    conn = _get_postgres_connection()
+    try:
+        return confirm_checkout_session(
+            session_id=session_id, tenant_id=tenant_id, role=role, conn=conn
+        )
+    finally:
+        conn.close()
