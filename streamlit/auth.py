@@ -28,6 +28,14 @@ class AccessDeniedError(Exception):
     """認証済みだが、世帯への所属(membership)が無い、または複数あって現状未対応の場合。"""
 
 
+class EmailNotVerifiedError(Exception):
+    """ログイン済みだがemail_verifiedがTrueでない場合。
+
+    この例外はDBへ一切アクセスする前に送出される(process_login()参照)。
+    tenant_id・DB内容は読み込まず、未確認ユーザーをmembershipへ自動登録することもない。
+    """
+
+
 def is_auth_enabled():
     return os.environ.get(AUTH_ENABLED_ENV, "").strip().lower() == "true"
 
@@ -67,12 +75,33 @@ def resolve_tenant_context(*, auth_subject, email, email_verified, conn):
     return tenant_id, role
 
 
+def process_login(*, email_verified, auth_subject, email, get_conn):
+    """ログイン済みである前提で、email_verified検証→membership解決を行う。
+
+    Streamlitの実行時コンテキストに依存しないため、実際のAuth0接続が無くても
+    テストできる。get_connはDB接続を遅延取得するための呼び出し可能オブジェクト
+    (値ではなく関数)。email_verifiedがTrueでない場合はDB接続を一切取得せずに
+    EmailNotVerifiedErrorを送出する(tenant_id・DB内容を読み込まない。未確認
+    ユーザーをmembershipへ自動登録することもない。仕様書/認証基盤設計.md参照)。
+    """
+    if email_verified is not True:
+        raise EmailNotVerifiedError("メールアドレスの確認を完了してください。")
+
+    conn = get_conn()
+    try:
+        return resolve_tenant_context(
+            auth_subject=auth_subject, email=email, email_verified=email_verified, conn=conn
+        )
+    finally:
+        conn.close()
+
+
 def require_login_and_resolve_tenant():
     """app.pyから呼ぶ入口。
 
     未ログインならst.login()導線を表示し、(None, None)を返す
-    (呼び出し側でst.stop()すること)。ログイン済みならtenant_id・roleを
-    resolve_tenant_context()で解決して返す(AccessDeniedErrorはそのまま伝播する)。
+    (呼び出し側でst.stop()すること)。ログイン済みならprocess_login()へ委譲する
+    (EmailNotVerifiedError・AccessDeniedErrorはそのまま伝播する)。
     """
     import streamlit as st  # Streamlit実行時コンテキストが必要な部分だけここに閉じ込める
 
@@ -80,14 +109,9 @@ def require_login_and_resolve_tenant():
         st.button("ログイン", on_click=st.login)
         return None, None
 
-    conn = db.get_connection()
-    try:
-        tenant_id, role = resolve_tenant_context(
-            auth_subject=st.user["sub"],
-            email=st.user.get("email"),
-            email_verified=bool(st.user.get("email_verified", False)),
-            conn=conn,
-        )
-    finally:
-        conn.close()
-    return tenant_id, role
+    return process_login(
+        email_verified=st.user.get("email_verified"),
+        auth_subject=st.user.get("sub"),
+        email=st.user.get("email"),
+        get_conn=db.get_connection,
+    )

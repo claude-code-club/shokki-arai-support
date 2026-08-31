@@ -73,6 +73,85 @@ def test_is_auth_enabled_other_values_are_false(monkeypatch):
     assert auth.is_auth_enabled() is False
 
 
+# --- process_login()のemail_verified強制(DB接続不要。DBへ一切触れないことも確認) ---
+
+
+def test_process_login_rejects_missing_email_verified():
+    conn_calls = []
+
+    with pytest.raises(auth.EmailNotVerifiedError):
+        auth.process_login(
+            email_verified=None,
+            auth_subject="auth0|x",
+            email="x@example.com",
+            get_conn=lambda: conn_calls.append(1) or pytest.fail("DB接続してはいけない"),
+        )
+
+    assert conn_calls == []  # tenant_id・DB内容を一切読み込んでいない
+
+
+def test_process_login_rejects_false_email_verified():
+    conn_calls = []
+
+    with pytest.raises(auth.EmailNotVerifiedError):
+        auth.process_login(
+            email_verified=False,
+            auth_subject="auth0|x",
+            email="x@example.com",
+            get_conn=lambda: conn_calls.append(1) or pytest.fail("DB接続してはいけない"),
+        )
+
+    assert conn_calls == []
+
+
+def test_process_login_rejects_truthy_non_bool_email_verified():
+    """email_verifiedが文字列"true"等(bool以外の真値)の場合も、Trueそのものでなければ拒否する。"""
+    conn_calls = []
+
+    with pytest.raises(auth.EmailNotVerifiedError):
+        auth.process_login(
+            email_verified="true",
+            auth_subject="auth0|x",
+            email="x@example.com",
+            get_conn=lambda: conn_calls.append(1) or pytest.fail("DB接続してはいけない"),
+        )
+
+    assert conn_calls == []
+
+
+@requires_db
+def test_process_login_allows_true_email_verified_and_resolves_tenant(auth_schema):
+    conn, tenant_id = auth_schema
+    with conn.cursor() as cur:
+        cur.execute("SHOW search_path")
+        schema_name = cur.fetchone()[0]
+    user_id = db.get_or_create_user(
+        conn, auth_subject="auth0|verified", email="a@example.com", email_verified=True
+    )
+    db.create_membership(conn, tenant_id=tenant_id, user_id=user_id, role="member")
+    conn.commit()
+
+    opened_conns = []
+
+    def get_conn():
+        c = db.get_connection()
+        with c.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema_name}")
+        opened_conns.append(c)
+        return c
+
+    resolved_tenant_id, role = auth.process_login(
+        email_verified=True,
+        auth_subject="auth0|verified",
+        email="a@example.com",
+        get_conn=get_conn,
+    )
+
+    assert resolved_tenant_id == tenant_id
+    assert role == "member"
+    assert opened_conns[-1].closed  # 自前で開いた接続が確実にcloseされている
+
+
 # --- migrate_to_auth_schema() ---
 
 

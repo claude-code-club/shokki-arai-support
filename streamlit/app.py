@@ -93,6 +93,9 @@ USER_ROLE = None
 if auth.is_auth_enabled():
     try:
         TENANT_ID, USER_ROLE = auth.require_login_and_resolve_tenant()
+    except auth.EmailNotVerifiedError:
+        st.error("メールアドレスの確認を完了してください。")
+        st.stop()
     except auth.AccessDeniedError as e:
         st.error(str(e))
         st.stop()
