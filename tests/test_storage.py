@@ -14,7 +14,6 @@ import storage  # noqa: E402
 from logic import load_dates as json_load_dates  # noqa: E402
 from logic import save_dates as json_save_dates  # noqa: E402
 import scripts.migrate_to_postgres as migrate_module  # noqa: E402
-import scripts.restore_json_from_postgres as restore_module  # noqa: E402
 
 
 requires_db = pytest.mark.skipif(
@@ -226,7 +225,12 @@ def test_migrate_rolls_back_insert_on_mismatch(tmp_path):
 
 @requires_db
 def test_all_entry_points_close_self_owned_connections(monkeypatch, tmp_path):
-    """項目12: storage / migrate_to_postgres / restore_json_from_postgres、いずれの経路でも接続が確実にcloseされる。"""
+    """項目12: storage / migrate_to_postgres、いずれの経路でも接続が確実にcloseされる。
+
+    restore_json_from_postgres.pyは第16回(マルチテナント設計)でtenant_idが必須に
+    なり、tenant_id列を持つ移行後スキーマ前提の関数になったため、ここでは対象外。
+    その接続close確認はtests/test_tenant_migration.py側で行う。
+    """
     captured = []
     real_get_connection = db.get_connection
 
@@ -258,10 +262,6 @@ def test_all_entry_points_close_self_owned_connections(monkeypatch, tmp_path):
     data_file = tmp_path / "records_for_migrate.json"
     json_save_dates({"2026-08-01"}, data_file=data_file)
     migrate_module.migrate(data_file=data_file)
-    assert captured[-1].closed
-
-    # restore_json_from_postgres.py(自前でconnを開くケース)
-    restore_module.restore_json_from_postgres(data_file=tmp_path / "restored.json")
     assert captured[-1].closed
 
 
