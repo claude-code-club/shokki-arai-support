@@ -80,6 +80,19 @@ def _get_price_id():
     return price_id
 
 
+def _attr(obj, name, default=None):
+    """辞書(テストの偽オブジェクト)・Stripeオブジェクト(属性アクセスのみ)の両方から
+    安全に値を取り出す。新しいstripeパッケージ(v15以降)のSession/Subscriptionは
+    dictの.get()をサポートしないため(属性アクセスのみ)、テストではdictを使い続けつつ
+    実際のstripeオブジェクトにも対応できるようにする。
+    """
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
 def get_plan_status(conn, *, tenant_id):
     """指定世帯の現在のプラン状態を返す({"plan", "status", "current_period_end"})。"""
     return db.get_subscription(conn, tenant_id=tenant_id)
@@ -130,19 +143,19 @@ def confirm_checkout_session(*, session_id, tenant_id, role, conn, stripe_client
     except Exception as e:
         raise StripeApiError("Stripeとの通信に失敗しました。") from e
 
-    if session.get("mode") != "subscription":
+    if _attr(session, "mode") != "subscription":
         raise InvalidSessionError("このCheckout Sessionはsubscriptionモードではありません。")
 
-    subscription = session.get("subscription")
-    subscription_status = subscription.get("status") if subscription else None
-    if session.get("status") != "complete" or subscription_status not in _ACTIVE_SUBSCRIPTION_STATUSES:
+    subscription = _attr(session, "subscription")
+    subscription_status = _attr(subscription, "status")
+    if _attr(session, "status") != "complete" or subscription_status not in _ACTIVE_SUBSCRIPTION_STATUSES:
         raise InvalidSessionError("決済または契約状態が有効ではありません。")
 
-    metadata = session.get("metadata") or {}
-    if metadata.get("tenant_id") != str(tenant_id):
+    metadata = _attr(session, "metadata") or {}
+    if _attr(metadata, "tenant_id") != str(tenant_id):
         raise TenantMismatchError("Checkout Sessionの世帯情報が一致しません。")
 
-    period_end_ts = subscription.get("current_period_end") if subscription else None
+    period_end_ts = _attr(subscription, "current_period_end")
     current_period_end = (
         datetime.fromtimestamp(period_end_ts, tz=timezone.utc) if period_end_ts else None
     )
@@ -153,9 +166,9 @@ def confirm_checkout_session(*, session_id, tenant_id, role, conn, stripe_client
             tenant_id=tenant_id,
             plan="standard",
             status=subscription_status,
-            stripe_customer_id=session.get("customer"),
-            stripe_subscription_id=subscription.get("id") if subscription else None,
-            stripe_checkout_session_id=session.get("id"),
+            stripe_customer_id=_attr(session, "customer"),
+            stripe_subscription_id=_attr(subscription, "id"),
+            stripe_checkout_session_id=_attr(session, "id"),
             current_period_end=current_period_end,
         )
         conn.commit()
