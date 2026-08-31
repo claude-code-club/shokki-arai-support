@@ -244,9 +244,12 @@ def test_migrate_rolls_back_everything_on_mismatch(tenant_schema):
         assert cur.fetchone()[0] == 0  # 新しいtenantsの挿入も取り消されている
 
 
-@requires_db
 def test_migrate_closes_self_owned_connection_on_failure(monkeypatch):
-    """conn省略時(自前で接続を開く場合)、DB未設定などの例外時も接続を確実にcloseする。"""
+    """conn省略時(自前で接続を開く場合)、DB未設定などの例外時も接続を確実にcloseする。
+
+    db.get_connection()はis_configured()ではなく環境変数を直接読むため、
+    DATABASE_URLそのものを削除して未設定状態を再現する(DB接続不要)。
+    """
     captured = []
     real_get_connection = db.get_connection
 
@@ -256,7 +259,7 @@ def test_migrate_closes_self_owned_connection_on_failure(monkeypatch):
         return conn
 
     monkeypatch.setattr(db, "get_connection", spy_get_connection)
-    monkeypatch.setattr(db, "is_configured", lambda: False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     with pytest.raises(db.DatabaseNotConfiguredError):
         migrate_tenant_module.migrate_to_tenant_schema(uuid.uuid4())
     # DatabaseNotConfiguredErrorはget_connection内部で送出されるため、captured自体は空でよい
