@@ -1,4 +1,5 @@
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -77,7 +78,7 @@ def test_restore_json_raises_when_database_not_configured(tmp_path, monkeypatch)
     data_file = tmp_path / "records.json"
 
     with pytest.raises(db.DatabaseNotConfiguredError):
-        restore_module.restore_json_from_postgres(data_file=data_file)
+        restore_module.restore_json_from_postgres(uuid.uuid4(), data_file=data_file)
 
     assert not data_file.exists()
 
@@ -96,9 +97,23 @@ def test_restore_json_cli_reports_error_when_database_not_configured(tmp_path, m
     monkeypatch.delenv("DATABASE_URL", raising=False)
     data_file = tmp_path / "records.json"
 
-    exit_code = restore_module.main(["restore_json_from_postgres.py", str(data_file)])
+    exit_code = restore_module.main(
+        ["restore_json_from_postgres.py", "--tenant-id", str(uuid.uuid4()), str(data_file)]
+    )
 
     assert exit_code == 1
+    assert not data_file.exists()
+
+
+def test_restore_json_cli_reports_error_on_invalid_uuid(tmp_path):
+    data_file = tmp_path / "records.json"
+
+    exit_code = restore_module.main(
+        ["restore_json_from_postgres.py", "--tenant-id", "not-a-uuid", str(data_file)]
+    )
+
+    assert exit_code == 1
+    assert not data_file.exists()
 
 
 # --- PostgreSQL連携テスト(DATABASE_URLが設定されている場合のみ実行。CIではpostgresサービスで実行される) ---
@@ -161,22 +176,6 @@ class TestWithRealDatabase:
         with pytest.raises(migrate_module.MigrationVerificationError):
             migrate_module.migrate(data_file=data_file, conn=conn)
 
-    def test_restore_json_from_postgres_writes_current_db_state(self, tmp_path, conn):
-        db.insert_dates({"2026-08-05", "2026-08-06"}, conn=conn)
-        data_file = tmp_path / "records.json"
-
-        dates = restore_module.restore_json_from_postgres(data_file=data_file, conn=conn)
-
-        assert dates == {"2026-08-05", "2026-08-06"}
-        assert json_load_dates(data_file=data_file) == {"2026-08-05", "2026-08-06"}
-
-    def test_restore_json_from_postgres_backs_up_existing_json(self, tmp_path, conn):
-        data_file = tmp_path / "records.json"
-        json_save_dates({"2026-07-01"}, data_file=data_file)
-        db.insert_dates({"2026-08-05"}, conn=conn)
-
-        restore_module.restore_json_from_postgres(data_file=data_file, conn=conn)
-
-        from logic import list_backups
-        backups = list_backups(data_file=data_file)
-        assert len(backups) >= 1
+    # restore_json_from_postgres()の検証は、第16回(マルチテナント設計)でtenant_idが
+    # 必須になり、tenant_id列を持つ移行後スキーマ前提の関数になったため、
+    # tests/test_tenant_migration.py側(隔離したテナント対応スキーマ)で行う。
