@@ -4,3 +4,4 @@ streamlit/data/
 .env
 .env.*
 !.env.example
+.streamlit/secrets.toml

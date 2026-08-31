@@ -11,6 +11,7 @@ from logic import (
     calc_current_streak,
     today_jst,
 )
+import auth
 from storage import (
     RecordsFileCorruptedError,
     StorageConfigError,
@@ -19,6 +20,7 @@ from storage import (
     cancel_date,
     get_tenant_id,
     load_dates,
+    rename_tenant,
 )
 
 # 東京の座標。Open-Meteo は無料・APIキー不要の天気API。
@@ -86,8 +88,25 @@ try:
 except (requests.RequestException, KeyError, ValueError):
     st.caption("（今日の天気は取得できませんでした）")
 
-try:
+USER_ROLE = None
+
+if auth.is_auth_enabled():
+    try:
+        TENANT_ID, USER_ROLE = auth.require_login_and_resolve_tenant()
+    except auth.EmailNotVerifiedError:
+        st.error("メールアドレスの確認を完了してください。")
+        st.stop()
+    except auth.AccessDeniedError as e:
+        st.error(str(e))
+        st.stop()
+    if TENANT_ID is None:
+        # 未ログイン。require_login_and_resolve_tenant()が既にログイン導線を表示済み。
+        st.stop()
+    st.sidebar.button("ログアウト", on_click=st.logout)
+else:
     TENANT_ID = get_tenant_id()
+
+try:
     dates = load_dates(tenant_id=TENANT_ID)
 except RecordsFileCorruptedError:
     st.error(
@@ -220,4 +239,20 @@ else:
     st.write("　".join(recent))
 
 st.caption(f"累計記録日数: {len(dates)}日")
+
+if auth.is_auth_enabled() and USER_ROLE == "admin":
+    st.divider()
+    st.subheader("世帯の設定(admin専用)")
+    new_name = st.text_input("世帯名")
+    if st.button("世帯名を変更する") and new_name:
+        try:
+            rename_tenant(new_name, tenant_id=TENANT_ID, role=USER_ROLE)
+        except (StorageConfigError, StorageUnavailableError):
+            st.error(
+                "世帯名の変更中に問題が発生しました。安全のため処理を停止しました。"
+                "しばらくしてから再度お試しいただくか、管理者に連絡してください。"
+            )
+            st.stop()
+        st.success("世帯名を変更しました。")
+
 st.caption("v1.1")
