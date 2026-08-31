@@ -18,6 +18,7 @@ scripts/migrate_to_tenant_schema.py）専用に残しており、テナント対
 """
 
 import os
+import uuid
 
 import psycopg
 
@@ -188,3 +189,59 @@ def compare_date_sets(json_dates, db_dates):
         "only_in_json": sorted(json_dates - db_dates),
         "only_in_db": sorted(db_dates - json_dates),
     }
+
+
+# --- 第17回(認証基盤): users・tenant_memberships(SQL操作のみ、commitしない) ---
+
+
+def get_or_create_user(conn, *, auth_subject, email, email_verified):
+    """auth_subjectで既存ユーザーを検索し、無ければ作成する。user_idを返す。
+
+    emailとemail_verifiedは、既存ユーザーでも呼び出しのたびにAuth0側の最新値で
+    同期する(アプリDB側は表示・監査用のキャッシュに過ぎず、真実の源はAuth0。
+    仕様書/認証基盤設計.md②参照)。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM users WHERE auth_subject = %s", (auth_subject,))
+        row = cur.fetchone()
+        if row is not None:
+            user_id = row[0]
+            cur.execute(
+                "UPDATE users SET email = %s, email_verified = %s WHERE id = %s",
+                (email, email_verified, user_id),
+            )
+            return user_id
+
+        user_id = uuid.uuid4()
+        cur.execute(
+            "INSERT INTO users (id, auth_subject, email, email_verified) "
+            "VALUES (%s, %s, %s, %s)",
+            (user_id, auth_subject, email, email_verified),
+        )
+        return user_id
+
+
+def get_memberships_for_user(conn, *, user_id):
+    """指定ユーザーの世帯所属一覧を[(tenant_id, role), ...]で返す。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT tenant_id, role FROM tenant_memberships WHERE user_id = %s",
+            (user_id,),
+        )
+        return cur.fetchall()
+
+
+def create_membership(conn, *, tenant_id, user_id, role):
+    """世帯への所属を作成する(冪等: 既に存在すれば何もしない、SQL操作のみ)。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO tenant_memberships (tenant_id, user_id, role) VALUES (%s, %s, %s) "
+            "ON CONFLICT (tenant_id, user_id) DO NOTHING",
+            (tenant_id, user_id, role),
+        )
+
+
+def update_tenant_name(conn, *, tenant_id, name):
+    """世帯名を変更する(SQL操作のみ)。呼び出し元がrole検証を行うこと(admin専用操作)。"""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE tenants SET name = %s WHERE id = %s", (name, tenant_id))

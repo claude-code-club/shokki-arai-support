@@ -178,3 +178,25 @@ def save_dates(dates, tenant_id=None):
         raise StorageUnavailableError("PostgreSQLへの書き込みに失敗しました。") from e
     finally:
         conn.close()
+
+
+def rename_tenant(name, tenant_id=None, role=None):
+    """世帯名を変更する(第17回: 認証基盤、admin専用操作)。
+
+    表示側でボタンを隠すだけでなく、DB操作の直前にもrole検証を行う
+    (仕様書/認証基盤設計.md⑨参照。サーバー側の最終防衛線)。
+    """
+    if get_backend_name() == "json":
+        raise StorageConfigError("jsonバックエンドでは世帯の概念がないため利用できません。")
+    _require_tenant_id(tenant_id)
+    if role != "admin":
+        raise StorageConfigError("この操作にはadmin権限が必要です。")
+    conn = _get_postgres_connection()
+    try:
+        db.update_tenant_name(conn, tenant_id=tenant_id, name=name)
+        conn.commit()
+    except psycopg.Error as e:
+        conn.rollback()
+        raise StorageUnavailableError("世帯名の変更に失敗しました。") from e
+    finally:
+        conn.close()
