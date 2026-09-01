@@ -309,7 +309,16 @@ def test_rename_tenant_requires_admin_role(monkeypatch, auth_schema):
 
 
 @requires_db
-@pytest.mark.parametrize("bad_name", ["", "   ", "あ" * 101, "新しい世帯名\x00", "新しい世帯名\n"])
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "",
+        "   ",
+        "あ" * 101,
+        "新しい世帯名\x00",
+        "新しい\n世帯名",  # 前後ではなく途中に制御文字を含む場合(strip()で消えないこと)
+    ],
+)
 def test_rename_tenant_rejects_invalid_input(monkeypatch, auth_schema, bad_name):
     """空文字・空白のみ・上限超過・制御文字は、すべてInvalidInputError(第21回)で
     拒否され、DBへは一切書き込まれないことを確認する。
