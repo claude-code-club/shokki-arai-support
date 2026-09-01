@@ -253,18 +253,28 @@ def update_tenant_name(conn, *, tenant_id, name):
 def get_subscription(conn, *, tenant_id):
     """指定世帯の課金状態を返す。行が無ければfree扱いの既定値を返す(行を作らない)。
 
-    戻り値: {"plan", "status", "current_period_end"}の辞書。
+    戻り値: {"plan", "status", "current_period_end", "stripe_customer_id"}の辞書。
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT plan, status, current_period_end FROM tenant_subscriptions "
-            "WHERE tenant_id = %s",
+            "SELECT plan, status, current_period_end, stripe_customer_id "
+            "FROM tenant_subscriptions WHERE tenant_id = %s",
             (tenant_id,),
         )
         row = cur.fetchone()
     if row is None:
-        return {"plan": "free", "status": "active", "current_period_end": None}
-    return {"plan": row[0], "status": row[1], "current_period_end": row[2]}
+        return {
+            "plan": "free",
+            "status": "active",
+            "current_period_end": None,
+            "stripe_customer_id": None,
+        }
+    return {
+        "plan": row[0],
+        "status": row[1],
+        "current_period_end": row[2],
+        "stripe_customer_id": row[3],
+    }
 
 
 def upsert_subscription_if_new_session(
@@ -312,5 +322,56 @@ def upsert_subscription_if_new_session(
                 stripe_checkout_session_id,
                 current_period_end,
             ),
+        )
+        return cur.fetchone() is not None
+
+
+# --- 第19回(継続課金・Webhook): processed_stripe_events・状態同期(SQL操作のみ、commitしない) ---
+
+
+def mark_stripe_event_processed(conn, *, event_id, event_type):
+    """指定したstripe_event_idを処理済みとして記録する(冪等: 既に記録済みなら何もしない)。
+
+    stripe_event_idはPRIMARY KEYのため、同じイベントの再処理はここで検知できる。
+    戻り値: 今回初めて記録した場合True、既に処理済みだった場合False。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO processed_stripe_events (stripe_event_id, event_type) "
+            "VALUES (%s, %s) ON CONFLICT (stripe_event_id) DO NOTHING "
+            "RETURNING stripe_event_id",
+            (event_id, event_type),
+        )
+        return cur.fetchone() is not None
+
+
+def find_tenant_id_by_subscription(conn, *, stripe_subscription_id):
+    """指定したstripe_subscription_idが紐づく世帯のtenant_idを返す(無ければNone)。
+
+    未知のsubscription_idから世帯を推測で作成することは行わない(呼び出し元が
+    Noneの場合はイベントを無視すること)。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT tenant_id FROM tenant_subscriptions WHERE stripe_subscription_id = %s",
+            (stripe_subscription_id,),
+        )
+        row = cur.fetchone()
+    return row[0] if row is not None else None
+
+
+def update_subscription_status(conn, *, tenant_id, plan, status, current_period_end):
+    """既存の世帯の課金状態を更新する(行が無ければ何もしない。新規作成はしない)。
+
+    Webhookによる状態同期(更新・解約・支払い失敗)専用。stripe_checkout_session_idは
+    変更しない(初回契約時に確定した値を保持し続ける)。
+    戻り値: 実際に更新した場合True、対象の行が無かった場合False。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE tenant_subscriptions SET plan = %s, status = %s, "
+            "current_period_end = %s, updated_at = now() WHERE tenant_id = %s "
+            "RETURNING tenant_id",
+            (plan, status, current_period_end, tenant_id),
         )
         return cur.fetchone() is not None

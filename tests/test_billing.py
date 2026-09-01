@@ -222,7 +222,12 @@ def test_create_checkout_session_wraps_stripe_error(monkeypatch):
 def test_get_plan_status_defaults_to_free_when_no_row(billing_schema):
     conn, tenant_id = billing_schema
     status = billing.get_plan_status(conn, tenant_id=tenant_id)
-    assert status == {"plan": "free", "status": "active", "current_period_end": None}
+    assert status == {
+        "plan": "free",
+        "status": "active",
+        "current_period_end": None,
+        "stripe_customer_id": None,
+    }
 
 
 # --- confirm_checkout_session: memberは拒否される(DB接続あり、Stripe未呼び出し) ---
