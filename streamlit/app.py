@@ -14,6 +14,7 @@ from logic import (
 )
 import auth
 import billing
+import metering
 from storage import (
     RecordsFileCorruptedError,
     StorageConfigError,
@@ -111,6 +112,63 @@ if auth.is_auth_enabled():
 else:
     TENANT_ID = get_tenant_id()
 
+
+def render_standard_upgrade_cta(key_suffix):
+    """第18回のCheckout Session作成をそのまま再利用する、Standardアップグレード導線
+    (第20回: プラン制限とメータリング)。admin専用。呼び出し箇所ごとに一意なkey_suffixを
+    渡すこと(同じ画面に複数のボタンを置けるようにするため)。
+    """
+    if st.button("Standardへアップグレードする（テスト決済）", key=f"_upgrade_button_{key_suffix}"):
+        base_url = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+        try:
+            checkout_session = billing.start_checkout_session(
+                tenant_id=TENANT_ID,
+                role=USER_ROLE,
+                success_url=f"{base_url}/?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{base_url}/?billing=cancelled",
+            )
+            st.session_state["_checkout_url"] = checkout_session.url
+        except billing.PermissionDeniedError:
+            st.error("この操作にはadmin権限が必要です。")
+        except billing.BillingConfigError:
+            st.error("課金機能が正しく設定されていません。管理者に連絡してください。")
+        except billing.StripeApiError:
+            st.error("Stripeとの通信に失敗しました。しばらくしてから再度お試しください。")
+
+    checkout_url = st.session_state.get("_checkout_url")
+    if checkout_url:
+        st.link_button("お支払いへ進む（Stripeのページへ移動します）", checkout_url)
+
+
+def build_30day_analysis(dates):
+    """直近30日間の記録日数を集計する(第20回: プラン制限とメータリング、Standard限定)。
+
+    純粋関数(DB・Streamlitに依存しない)。datesは既にDBから読み込み済みの集合を渡す。
+    """
+    from datetime import timedelta
+
+    today = today_jst()
+    window = [(today - timedelta(days=i)).isoformat() for i in range(30)]
+    filled_in_window = sorted((d for d in window if d in dates), reverse=True)
+    return {"filled_count": len(filled_in_window), "total_days": 30, "filled_dates": filled_in_window}
+
+
+def generate_monthly_reflection(filled_days, days_in_month, month_label):
+    """「今月の振り返り」の本文を組み立てる(第20回: プラン制限とメータリング)。
+
+    純粋関数。外部API(Claude等)は使わず、既存の集計値だけから生成する(最小構成)。
+    """
+    filled_count = len(filled_days)
+    rate = filled_count / days_in_month
+    if rate >= 1.0:
+        return f"今月は{month_label}、皆勤達成です！素晴らしい継続力ですね。"
+    if rate >= 0.7:
+        return f"今月は{month_label}、{filled_count}/{days_in_month}日達成。とても良いペースです。"
+    if rate >= 0.3:
+        return f"今月は{month_label}、{filled_count}/{days_in_month}日達成。無理のないペースで続けましょう。"
+    return f"今月は{month_label}、{filled_count}/{days_in_month}日。焦らず、できる日から積み重ねましょう。"
+
+
 if auth.is_auth_enabled() and billing.is_billing_enabled():
     st.divider()
     st.subheader("プラン")
@@ -149,26 +207,7 @@ if auth.is_auth_enabled() and billing.is_billing_enabled():
         st.caption("Free：0円 ／ Standard：月額500円（テストモードでの仮価格）")
 
         if not is_standard and USER_ROLE == "admin":
-            if st.button("Standardを購入する（テスト決済）"):
-                base_url = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
-                try:
-                    checkout_session = billing.start_checkout_session(
-                        tenant_id=TENANT_ID,
-                        role=USER_ROLE,
-                        success_url=f"{base_url}/?session_id={{CHECKOUT_SESSION_ID}}",
-                        cancel_url=f"{base_url}/?billing=cancelled",
-                    )
-                    st.session_state["_checkout_url"] = checkout_session.url
-                except billing.PermissionDeniedError:
-                    st.error("この操作にはadmin権限が必要です。")
-                except billing.BillingConfigError:
-                    st.error("課金機能が正しく設定されていません。管理者に連絡してください。")
-                except billing.StripeApiError:
-                    st.error("Stripeとの通信に失敗しました。しばらくしてから再度お試しください。")
-
-            checkout_url = st.session_state.get("_checkout_url")
-            if checkout_url:
-                st.link_button("お支払いへ進む（Stripeのページへ移動します）", checkout_url)
+            render_standard_upgrade_cta("plan_section")
 
         if is_standard and USER_ROLE == "admin":
             if st.button("サブスクを管理する（解約はこちらから）"):
@@ -324,6 +363,76 @@ else:
     st.write("　".join(recent))
 
 st.caption(f"累計記録日数: {len(dates)}日")
+
+if auth.is_auth_enabled() and billing.is_billing_enabled():
+    # --- 30日間の詳細分析(第20回: プラン制限とメータリング、Standard限定) ---
+    st.divider()
+    st.subheader("30日間の詳細分析（Standard限定）")
+    try:
+        plan_status_for_analysis = billing.fetch_plan_status(TENANT_ID)
+        standard_access = billing.has_standard_access(plan_status_for_analysis)
+    except (billing.BillingUnavailableError, billing.BillingConfigError):
+        # 契約状態を確認できない場合は開放しない(fail closed。仕様書/プラン制限・メータリング設計.md⑨参照)
+        standard_access = False
+
+    if standard_access:
+        analysis = build_30day_analysis(dates)
+        st.metric("直近30日間の記録日数", f"{analysis['filled_count']} / {analysis['total_days']} 日")
+        if analysis["filled_dates"]:
+            st.write("　".join(analysis["filled_dates"]))
+        else:
+            st.caption("直近30日間の記録はまだありません。")
+    else:
+        st.info("🔒 この機能はStandardプラン限定です。")
+        if USER_ROLE == "admin":
+            render_standard_upgrade_cta("analysis_gate")
+
+    # --- 今月の振り返り(第20回: プラン制限とメータリング、Free月3回まで) ---
+    st.divider()
+    st.subheader("今月の振り返り")
+    try:
+        reflection_status = metering.fetch_monthly_reflection_status(TENANT_ID)
+    except metering.MeteringUnavailableError:
+        reflection_status = None
+        st.caption("利用状況を取得できませんでした。しばらくしてから再度お試しください。")
+
+    if reflection_status is not None:
+        if reflection_status["has_standard_access"]:
+            st.caption("Standard: 今月の振り返りは無制限で利用できます。")
+        else:
+            st.caption(
+                f"Free: 今月の利用回数 {reflection_status['usage_count']} / "
+                f"{reflection_status['limit']} 回"
+            )
+
+        if st.button("今月の振り返りを見る"):
+            try:
+                metering.use_monthly_reflection(TENANT_ID)
+                st.session_state["_reflection_limit_reached"] = False
+                st.session_state["_reflection_text"] = generate_monthly_reflection(
+                    filled_days, days_in_month, month_label
+                )
+                st.rerun()
+            except metering.UsageLimitExceededError:
+                st.session_state["_reflection_text"] = None
+                st.session_state["_reflection_limit_reached"] = True
+            except metering.MeteringUnavailableError:
+                st.error(
+                    "利用状況の更新に失敗しました。安全のため処理を停止しました。"
+                    "しばらくしてから再度お試しいただくか、管理者に連絡してください。"
+                )
+                st.stop()
+
+        if st.session_state.get("_reflection_limit_reached"):
+            st.warning(
+                f"今月の無料利用回数（{reflection_status['limit']}回）を使い切りました。"
+                "Standardへアップグレードすると無制限で利用できます。"
+            )
+            if USER_ROLE == "admin":
+                render_standard_upgrade_cta("reflection_limit")
+
+        if st.session_state.get("_reflection_text"):
+            st.info(st.session_state["_reflection_text"])
 
 if auth.is_auth_enabled() and USER_ROLE == "admin":
     st.divider()
