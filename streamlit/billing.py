@@ -113,6 +113,21 @@ def get_plan_status(conn, *, tenant_id):
     return db.get_subscription(conn, tenant_id=tenant_id)
 
 
+def has_standard_access(plan_status):
+    """Standard限定機能を使える契約状態かどうかを返す(第20回: プラン制限とメータリング)。
+
+    第19回のcustomer.subscription.updatedハンドラ(webhook.py)と同じ判定
+    (status in _ACTIVE_SUBSCRIPTION_STATUSES)を再利用し、別の判定を新設しない。
+    status="past_due"(支払い失敗中)はplan="standard"のまま残るが、ここではFalseになる
+    (仕様書/プラン制限・メータリング設計.md③参照。支払いが回復しWebhookでstatusが
+    active等へ戻るまでFree相当の制限を適用する)。
+    """
+    return (
+        plan_status["plan"] == "standard"
+        and plan_status["status"] in _ACTIVE_SUBSCRIPTION_STATUSES
+    )
+
+
 def create_checkout_session(*, tenant_id, role, success_url, cancel_url, stripe_client=None):
     """Standardプランの契約用Checkout Sessionをサーバー側で作成する(admin専用)。
 

@@ -375,3 +375,51 @@ def update_subscription_status(conn, *, tenant_id, plan, status, current_period_
             (plan, status, current_period_end, tenant_id),
         )
         return cur.fetchone() is not None
+
+
+# --- 第20回(プラン制限とメータリング): tenant_usage(SQL操作のみ、commitしない) ---
+
+
+def get_tenant_usage_count(conn, *, tenant_id, metric_key, period_start):
+    """指定した世帯・指標・期間の使用回数を返す。行が無ければ0(行を作らない)。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT usage_count FROM tenant_usage "
+            "WHERE tenant_id = %s AND metric_key = %s AND period_start = %s",
+            (tenant_id, metric_key, period_start),
+        )
+        row = cur.fetchone()
+    return row[0] if row is not None else 0
+
+
+def increment_tenant_usage_if_under_limit(conn, *, tenant_id, metric_key, period_start, limit):
+    """指定した世帯・指標・期間の使用回数を原子的に1加算する。
+
+    limitがNoneの場合は上限なしで常に加算する(Standard向け)。limitが数値の場合、
+    既存の使用回数がlimit未満のときだけ加算する(Free向け)。「読み込み→Python側で
+    加算→保存」ではなく、1回のSQL(INSERT ... ON CONFLICT ... WHERE)で原子的に行うため、
+    同時リクエスト・Streamlitの再実行や二重クリックが重なっても上限を超えて加算されない
+    (仕様書/プラン制限・メータリング設計.md⑤参照)。
+    戻り値: 加算後のusage_count(加算できた場合)。上限に達していて加算できなかった
+    場合はNone。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO tenant_usage (tenant_id, metric_key, period_start, usage_count, updated_at)
+            VALUES (%(tenant_id)s, %(metric_key)s, %(period_start)s, 1, now())
+            ON CONFLICT (tenant_id, metric_key, period_start) DO UPDATE SET
+                usage_count = tenant_usage.usage_count + 1,
+                updated_at = now()
+            WHERE %(limit)s::integer IS NULL OR tenant_usage.usage_count < %(limit)s::integer
+            RETURNING usage_count
+            """,
+            {
+                "tenant_id": tenant_id,
+                "metric_key": metric_key,
+                "period_start": period_start,
+                "limit": limit,
+            },
+        )
+        row = cur.fetchone()
+        return row[0] if row is not None else None
