@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 
 import psycopg
 
+import authz
 import db
 
 BILLING_ENABLED_ENV = "BILLING_ENABLED"
@@ -28,6 +29,7 @@ STRIPE_SECRET_KEY_ENV = "STRIPE_SECRET_KEY"
 STRIPE_PRICE_ID_STANDARD_ENV = "STRIPE_PRICE_ID_STANDARD"
 
 _ACTIVE_SUBSCRIPTION_STATUSES = ("active", "trialing")
+MAX_SESSION_ID_LENGTH = 500
 
 
 class BillingConfigError(Exception):
@@ -60,6 +62,15 @@ class BillingUnavailableError(Exception):
 
 def is_billing_enabled():
     return os.environ.get(BILLING_ENABLED_ENV, "").strip().lower() == "true"
+
+
+def _require_reasonable_length(value, *, field_name, max_length):
+    """URLクエリパラメータ等、利用者が改ざんできる値の長さを検証する(第21回:
+    SaaSのセキュリティ堅牢化)。空文字・None・上限超過はすべてInvalidSessionError
+    にまとめる(呼び出し元のStripe API呼び出しへ、不必要に長い値を渡さないため)。
+    """
+    if not value or not isinstance(value, str) or len(value) > max_length:
+        raise InvalidSessionError(f"{field_name}の形式が不正です。")
 
 
 def _get_stripe_client():
@@ -134,8 +145,10 @@ def create_checkout_session(*, tenant_id, role, success_url, cancel_url, stripe_
     tenant_id・roleは呼び出し側(app.py)がログインセッションから確定済みの値を渡すこと
     (ブラウザ入力・URLパラメータからは一切受け取らない)。
     """
-    if role != "admin":
-        raise PermissionDeniedError("世帯プランの購入にはadmin権限が必要です。")
+    try:
+        authz.require_admin(role)
+    except authz.NotAdminError as e:
+        raise PermissionDeniedError(str(e)) from e
 
     stripe_client = stripe_client or _get_stripe_client()
     price_id = _get_price_id()
@@ -167,8 +180,11 @@ def confirm_checkout_session(*, session_id, tenant_id, role, conn, stripe_client
     - metadataのtenant_idが現在の世帯と一致しない場合: TenantMismatchError
     - 上記いずれの場合もDBへは一切書き込まない(Freeのまま)。
     """
-    if role != "admin":
-        raise PermissionDeniedError("世帯プランの購入にはadmin権限が必要です。")
+    try:
+        authz.require_admin(role)
+    except authz.NotAdminError as e:
+        raise PermissionDeniedError(str(e)) from e
+    _require_reasonable_length(session_id, field_name="session_id", max_length=MAX_SESSION_ID_LENGTH)
 
     stripe_client = stripe_client or _get_stripe_client()
     try:
@@ -283,8 +299,10 @@ def create_billing_portal_session(*, tenant_id, role, conn, return_url, stripe_c
     実際の解約操作はStripeホスト型の画面で行われ、結果はcustomer.subscription.deleted
     Webhookで反映される(アプリ側は解約処理そのものを実装しない。仕様書/Webhook設計.md⑦参照)。
     """
-    if role != "admin":
-        raise PermissionDeniedError("サブスクの管理にはadmin権限が必要です。")
+    try:
+        authz.require_admin(role)
+    except authz.NotAdminError as e:
+        raise PermissionDeniedError(str(e)) from e
 
     subscription = get_plan_status(conn, tenant_id=tenant_id)
     customer_id = subscription.get("stripe_customer_id")

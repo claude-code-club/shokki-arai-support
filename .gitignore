@@ -5,3 +5,5 @@ streamlit/data/
 .env.*
 !.env.example
 .streamlit/secrets.toml
+*.sql
+*.log
