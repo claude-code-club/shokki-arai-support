@@ -22,6 +22,7 @@ import uuid
 
 import psycopg
 
+import authz
 import db
 import logic
 from logic import RecordsFileCorruptedError  # noqa: F401 (app.pyから再利用)
@@ -39,6 +40,36 @@ class StorageConfigError(Exception):
 
 class StorageUnavailableError(Exception):
     """PostgreSQLへの接続・読み書きに失敗した場合。JSONへは自動フォールバックしない。"""
+
+
+class InvalidInputError(StorageConfigError):
+    """入力値が長さ・形式の検証に失敗した場合(第21回: SaaSのセキュリティ堅牢化)。
+
+    StorageConfigErrorのサブクラスにすることで、既存のapp.py側の
+    except (StorageConfigError, StorageUnavailableError)がそのまま
+    安全なエラーメッセージ表示に使える(呼び出し元を変更しない)。
+    """
+
+
+TENANT_NAME_MAX_LENGTH = 100
+
+
+def _validate_tenant_name(name):
+    """世帯名の長さ・形式をサーバー側で検証する(第21回: SaaSのセキュリティ堅牢化)。
+
+    画面を隠すだけでなく、DB書き込みの直前にも検証する。空文字・上限超過・
+    制御文字はすべてInvalidInputErrorにまとめる。戻り値は前後空白を除いた文字列。
+    """
+    if not isinstance(name, str):
+        raise InvalidInputError("世帯名は文字列で指定してください。")
+    stripped = name.strip()
+    if not stripped:
+        raise InvalidInputError("世帯名を入力してください。")
+    if len(stripped) > TENANT_NAME_MAX_LENGTH:
+        raise InvalidInputError(f"世帯名は{TENANT_NAME_MAX_LENGTH}文字以内で入力してください。")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in stripped):
+        raise InvalidInputError("世帯名に制御文字を含めることはできません。")
+    return stripped
 
 
 def get_backend_name():
@@ -189,11 +220,14 @@ def rename_tenant(name, tenant_id=None, role=None):
     if get_backend_name() == "json":
         raise StorageConfigError("jsonバックエンドでは世帯の概念がないため利用できません。")
     _require_tenant_id(tenant_id)
-    if role != "admin":
-        raise StorageConfigError("この操作にはadmin権限が必要です。")
+    try:
+        authz.require_admin(role)
+    except authz.NotAdminError as e:
+        raise StorageConfigError(str(e)) from e
+    validated_name = _validate_tenant_name(name)
     conn = _get_postgres_connection()
     try:
-        db.update_tenant_name(conn, tenant_id=tenant_id, name=name)
+        db.update_tenant_name(conn, tenant_id=tenant_id, name=validated_name)
         conn.commit()
     except psycopg.Error as e:
         conn.rollback()

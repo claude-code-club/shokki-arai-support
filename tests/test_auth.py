@@ -270,9 +270,13 @@ def test_resolve_tenant_context_cross_tenant_isolation(auth_schema):
 # --- storage.rename_tenant()(admin専用操作、サーバー側role検証) ---
 
 
-@requires_db
-def test_rename_tenant_requires_admin_role(monkeypatch, auth_schema):
-    conn, tenant_id = auth_schema
+def _use_postgres_backend_with_schema(monkeypatch, conn):
+    """rename_tenant()系のテストで共通する、postgresバックエンド・スキーマ固定のセットアップ。
+
+    db.get_connection()をスパイし、storage.pyが自前で開く接続にも、conn自身が
+    今使っている隔離スキーマのsearch_pathを設定してから返す(第21回で追加した
+    入力検証テストと既存のadmin検証テストの両方から使う)。
+    """
     monkeypatch.setenv(storage.STORAGE_BACKEND_ENV, "postgres")
 
     real_get_connection = db.get_connection
@@ -288,6 +292,12 @@ def test_rename_tenant_requires_admin_role(monkeypatch, auth_schema):
 
     monkeypatch.setattr(db, "get_connection", patched_get_connection)
 
+
+@requires_db
+def test_rename_tenant_requires_admin_role(monkeypatch, auth_schema):
+    conn, tenant_id = auth_schema
+    _use_postgres_backend_with_schema(monkeypatch, conn)
+
     with pytest.raises(storage.StorageConfigError):
         storage.rename_tenant("新しい世帯名", tenant_id=tenant_id, role="member")
 
@@ -296,6 +306,59 @@ def test_rename_tenant_requires_admin_role(monkeypatch, auth_schema):
     with conn.cursor() as cur:
         cur.execute("SELECT name FROM tenants WHERE id = %s", (tenant_id,))
         assert cur.fetchone()[0] == "新しい世帯名"
+
+
+@requires_db
+@pytest.mark.parametrize("bad_name", ["", "   ", "あ" * 101, "新しい世帯名\x00", "新しい世帯名\n"])
+def test_rename_tenant_rejects_invalid_input(monkeypatch, auth_schema, bad_name):
+    """空文字・空白のみ・上限超過・制御文字は、すべてInvalidInputError(第21回)で
+    拒否され、DBへは一切書き込まれないことを確認する。
+    """
+    conn, tenant_id = auth_schema
+    _use_postgres_backend_with_schema(monkeypatch, conn)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT name FROM tenants WHERE id = %s", (tenant_id,))
+        original_name = cur.fetchone()[0]
+
+    with pytest.raises(storage.InvalidInputError):
+        storage.rename_tenant(bad_name, tenant_id=tenant_id, role="admin")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT name FROM tenants WHERE id = %s", (tenant_id,))
+        assert cur.fetchone()[0] == original_name
+
+
+@requires_db
+def test_rename_tenant_strips_surrounding_whitespace(monkeypatch, auth_schema):
+    conn, tenant_id = auth_schema
+    _use_postgres_backend_with_schema(monkeypatch, conn)
+
+    storage.rename_tenant("  新しい世帯名  ", tenant_id=tenant_id, role="admin")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT name FROM tenants WHERE id = %s", (tenant_id,))
+        assert cur.fetchone()[0] == "新しい世帯名"
+
+
+@requires_db
+def test_rename_tenant_stores_sql_injection_shaped_name_as_literal_text(monkeypatch, auth_schema):
+    """プレースホルダー経由でSQLを組み立てているため、SQLインジェクション形式の
+    文字列を渡しても余計なSQLとして実行されず、そのまま文字列として保存される
+    ことを確認する(第21回: SaaSのセキュリティ堅牢化)。
+    """
+    conn, tenant_id = auth_schema
+    _use_postgres_backend_with_schema(monkeypatch, conn)
+    payload = "'; DROP TABLE tenants; --"
+
+    storage.rename_tenant(payload, tenant_id=tenant_id, role="admin")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT name FROM tenants WHERE id = %s", (tenant_id,))
+        assert cur.fetchone()[0] == payload
+        # tenantsテーブル自体が実際にDROPされていないことも確認する。
+        cur.execute("SELECT count(*) FROM tenants")
+        assert cur.fetchone()[0] >= 1
 
 
 # --- bootstrap_admin_membership.py ---

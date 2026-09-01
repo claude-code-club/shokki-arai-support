@@ -35,6 +35,8 @@ def get_encouragement(streak, best_streak):
         return message.content[0].text.strip()
     except Exception as e:
         # 外部APIの失敗理由を問わず、ここで必ず吸収してアプリを落とさない。
-        # ただし原因が分かるよう、標準エラー出力（ホスティング先のログ）には残す。
-        print(f"[encourage] Claude API呼び出し失敗: {e}", file=sys.stderr)
+        # 原因の見当がつく程度の情報(例外の型名)だけを標準エラー出力
+        # （ホスティング先のログ）に残す。例外メッセージ本体は出さない
+        # (第21回: SaaSのセキュリティ堅牢化。APIキー等が意図せず含まれないようにする)。
+        print(f"[encourage] Claude API呼び出し失敗: {type(e).__name__}", file=sys.stderr)
         return None

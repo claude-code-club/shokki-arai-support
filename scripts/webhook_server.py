@@ -35,6 +35,12 @@ import webhook  # noqa: E402
 STRIPE_SECRET_KEY_ENV = "STRIPE_SECRET_KEY"
 STRIPE_WEBHOOK_SECRET_ENV = "STRIPE_WEBHOOK_SECRET"
 
+# Stripeの実際のWebhookペイロードは通常数KB程度。65536バイト(64KB)を大きく
+# 超えることは無い前提で上限を設ける(第21回: SaaSのセキュリティ堅牢化)。
+# Content-Lengthがこれを超えるリクエストは、本文を読み込む前に拒否する
+# (巨大なContent-Lengthを送りつけるDoSへの対策)。
+MAX_CONTENT_LENGTH = 65536
+
 # 秘密値や個人情報を含みうるイベント本文・署名は一切print/logしない。
 # ログに出すのは種別・成否・event_idなど、非機密の要約情報だけに限定する。
 
@@ -51,7 +57,28 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"ok")
 
     def do_POST(self):
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            print("[NG] Content-Lengthヘッダの形式が不正です。リクエストを拒否しました。")
+            self._respond(400)
+            return
+        if content_length < 0:
+            print("[NG] Content-Lengthヘッダが負数です。リクエストを拒否しました。")
+            self._respond(400)
+            return
+        if content_length > MAX_CONTENT_LENGTH:
+            # 本文を読み込む前に拒否する(巨大なContent-Lengthによるメモリ圧迫を防ぐ)。
+            print(f"[NG] リクエスト本文が上限({MAX_CONTENT_LENGTH}バイト)を超えています。拒否しました。")
+            self._respond(413)
+            return
+
+        content_type = self.headers.get("Content-Type", "")
+        if not content_type.split(";")[0].strip().lower() == "application/json":
+            print("[NG] Content-Typeがapplication/jsonではありません。リクエストを拒否しました。")
+            self._respond(400)
+            return
+
         payload = self.rfile.read(content_length)
         sig_header = self.headers.get("Stripe-Signature", "")
 
@@ -70,16 +97,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         stripe.api_key = os.environ.get(STRIPE_SECRET_KEY_ENV, "").strip()
 
-        conn = db.get_connection()
+        conn = None
         try:
+            conn = db.get_connection()
             result = webhook.process_event(conn, event, stripe_client=stripe)
             print(f"[OK] event_type={getattr(event, 'type', '?')}, handled={result.get('handled')}")
         except Exception:
+            # DB接続自体の失敗も含め、内部例外の詳細はクライアントへもログへも出さない。
             print("[NG] Webhookイベントの処理中にエラーが発生しました。")
             self._respond(500)
             return
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
         self._respond(200)
 

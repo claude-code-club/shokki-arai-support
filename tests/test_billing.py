@@ -250,6 +250,28 @@ def test_confirm_checkout_session_rejects_member(billing_schema):
     assert billing.get_plan_status(conn, tenant_id=tenant_id)["plan"] == "free"
 
 
+# --- session_idの長さ検証(第21回: SaaSのセキュリティ堅牢化) ---
+
+
+@pytest.mark.parametrize("bad_session_id", ["", "x" * (billing.MAX_SESSION_ID_LENGTH + 1)])
+def test_confirm_checkout_session_rejects_invalid_session_id_length(billing_schema, bad_session_id):
+    """空文字・上限超過のsession_idは、Stripe APIを呼ぶ前にInvalidSessionErrorで拒否する。"""
+    conn, tenant_id = billing_schema
+    fake_api = FakeSessionAPI(retrieve_return=make_valid_session(tenant_id=tenant_id))
+    fake_client = FakeStripeClient(fake_api)
+
+    with pytest.raises(billing.InvalidSessionError):
+        billing.confirm_checkout_session(
+            session_id=bad_session_id,
+            tenant_id=tenant_id,
+            role="admin",
+            conn=conn,
+            stripe_client=fake_client,
+        )
+    assert fake_api.retrieve_calls == []
+    assert billing.get_plan_status(conn, tenant_id=tenant_id)["plan"] == "free"
+
+
 # --- 未払い・無効なSessionを拒否 ---
 
 
