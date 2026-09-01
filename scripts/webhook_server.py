@@ -73,7 +73,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         conn = db.get_connection()
         try:
             result = webhook.process_event(conn, event, stripe_client=stripe)
-            print(f"[OK] event_type={event.get('type')}, handled={result.get('handled')}")
+            print(f"[OK] event_type={getattr(event, 'type', '?')}, handled={result.get('handled')}")
         except Exception:
             print("[NG] Webhookイベントの処理中にエラーが発生しました。")
             self._respond(500)
