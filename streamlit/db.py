@@ -411,7 +411,7 @@ def increment_tenant_usage_if_under_limit(conn, *, tenant_id, metric_key, period
             ON CONFLICT (tenant_id, metric_key, period_start) DO UPDATE SET
                 usage_count = tenant_usage.usage_count + 1,
                 updated_at = now()
-            WHERE %(limit)s IS NULL OR tenant_usage.usage_count < %(limit)s
+            WHERE %(limit)s::integer IS NULL OR tenant_usage.usage_count < %(limit)s::integer
             RETURNING usage_count
             """,
             {
