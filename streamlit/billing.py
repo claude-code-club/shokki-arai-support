@@ -132,6 +132,11 @@ def create_checkout_session(*, tenant_id, role, success_url, cancel_url, stripe_
             success_url=success_url,
             cancel_url=cancel_url,
             metadata={"tenant_id": str(tenant_id)},
+            # subscription_data.metadataにも同じtenant_idを載せる。作成されるSubscription
+            # オブジェクト自身にtenant_idを持たせることで、Webhook側でも参照できるようにする
+            # (仕様書/Webhook設計.md⑤参照。実際の状態同期はDB側のstripe_subscription_id
+            # 逆引きを主経路とし、こちらは冗長化のための予備情報)。
+            subscription_data={"metadata": {"tenant_id": str(tenant_id)}},
         )
     except (BillingConfigError, PermissionDeniedError):
         raise
@@ -170,21 +175,9 @@ def confirm_checkout_session(*, session_id, tenant_id, role, conn, stripe_client
     if _attr(metadata, "tenant_id") != str(tenant_id):
         raise TenantMismatchError("Checkout Sessionの世帯情報が一致しません。")
 
-    period_end_ts = _subscription_current_period_end(subscription)
-    current_period_end = (
-        datetime.fromtimestamp(period_end_ts, tz=timezone.utc) if period_end_ts else None
-    )
-
     try:
-        applied = db.upsert_subscription_if_new_session(
-            conn,
-            tenant_id=tenant_id,
-            plan="standard",
-            status=subscription_status,
-            stripe_customer_id=_attr(session, "customer"),
-            stripe_subscription_id=_attr(subscription, "id"),
-            stripe_checkout_session_id=_attr(session, "id"),
-            current_period_end=current_period_end,
+        applied = _apply_checkout_completion(
+            conn, tenant_id=tenant_id, session=session, subscription=subscription
         )
         conn.commit()
     except psycopg.Error:
@@ -192,6 +185,32 @@ def confirm_checkout_session(*, session_id, tenant_id, role, conn, stripe_client
         raise
 
     return applied
+
+
+def _apply_checkout_completion(conn, *, tenant_id, session, subscription):
+    """検証済みのsession/subscriptionをtenant_subscriptionsへ反映する(SQL操作のみ、
+    commitはしない。呼び出し元がcommit/rollbackを行うこと)。
+
+    confirm_checkout_session()(success_url確認)とwebhook.py側の
+    checkout.session.completedハンドラの両方から共通で呼ばれる(仕様書/Webhook設計.md⑧参照)。
+    呼び出し元がmode・状態・tenant_id一致の検証を済ませていることが前提で、この関数自体は
+    検証を行わない。
+    """
+    subscription_status = _attr(subscription, "status")
+    period_end_ts = _subscription_current_period_end(subscription)
+    current_period_end = (
+        datetime.fromtimestamp(period_end_ts, tz=timezone.utc) if period_end_ts else None
+    )
+    return db.upsert_subscription_if_new_session(
+        conn,
+        tenant_id=tenant_id,
+        plan="standard",
+        status=subscription_status,
+        stripe_customer_id=_attr(session, "customer"),
+        stripe_subscription_id=_attr(subscription, "id"),
+        stripe_checkout_session_id=_attr(session, "id"),
+        current_period_end=current_period_end,
+    )
 
 
 # --- app.pyから使う、DB接続を自前で管理するラッパー(storage.pyと同じ方針) ---
@@ -234,6 +253,46 @@ def apply_checkout_session(*, session_id, tenant_id, role):
     try:
         return confirm_checkout_session(
             session_id=session_id, tenant_id=tenant_id, role=role, conn=conn
+        )
+    finally:
+        conn.close()
+
+
+class NoActiveSubscriptionError(Exception):
+    """Standard契約がない世帯に対して、解約用のBilling Portalを開こうとした場合。"""
+
+
+def create_billing_portal_session(*, tenant_id, role, conn, return_url, stripe_client=None):
+    """解約・支払い方法変更用のStripe Billing Portal Sessionを作成する(admin専用)。
+
+    実際の解約操作はStripeホスト型の画面で行われ、結果はcustomer.subscription.deleted
+    Webhookで反映される(アプリ側は解約処理そのものを実装しない。仕様書/Webhook設計.md⑦参照)。
+    """
+    if role != "admin":
+        raise PermissionDeniedError("サブスクの管理にはadmin権限が必要です。")
+
+    subscription = get_plan_status(conn, tenant_id=tenant_id)
+    customer_id = subscription.get("stripe_customer_id")
+    if not customer_id:
+        raise NoActiveSubscriptionError("この世帯には有効な契約がありません。")
+
+    stripe_client = stripe_client or _get_stripe_client()
+    try:
+        return stripe_client.billing_portal.Session.create(
+            customer=customer_id, return_url=return_url
+        )
+    except (BillingConfigError, PermissionDeniedError):
+        raise
+    except Exception as e:
+        raise StripeApiError("Stripeとの通信に失敗しました。") from e
+
+
+def start_billing_portal_session(*, tenant_id, role, return_url):
+    """app.pyから呼ぶ入口。Billing Portal Sessionを作成し、遷移先URLを返す。"""
+    conn = _get_postgres_connection()
+    try:
+        return create_billing_portal_session(
+            tenant_id=tenant_id, role=role, conn=conn, return_url=return_url
         )
     finally:
         conn.close()

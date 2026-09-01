@@ -170,6 +170,27 @@ if auth.is_auth_enabled() and billing.is_billing_enabled():
             if checkout_url:
                 st.link_button("お支払いへ進む（Stripeのページへ移動します）", checkout_url)
 
+        if is_standard and USER_ROLE == "admin":
+            if st.button("サブスクを管理する（解約はこちらから）"):
+                base_url = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+                try:
+                    portal_session = billing.start_billing_portal_session(
+                        tenant_id=TENANT_ID, role=USER_ROLE, return_url=f"{base_url}/"
+                    )
+                    st.session_state["_billing_portal_url"] = portal_session.url
+                except billing.PermissionDeniedError:
+                    st.error("この操作にはadmin権限が必要です。")
+                except billing.NoActiveSubscriptionError:
+                    st.error("有効な契約が見つかりませんでした。")
+                except billing.BillingConfigError:
+                    st.error("課金機能が正しく設定されていません。管理者に連絡してください。")
+                except billing.StripeApiError:
+                    st.error("Stripeとの通信に失敗しました。しばらくしてから再度お試しください。")
+
+            portal_url = st.session_state.get("_billing_portal_url")
+            if portal_url:
+                st.link_button("サブスクの管理へ進む（Stripeのページへ移動します）", portal_url)
+
 try:
     dates = load_dates(tenant_id=TENANT_ID)
 except RecordsFileCorruptedError:
