@@ -100,6 +100,23 @@ def billing_schema():
 # --- BILLING_ENABLEDの判定(DB接続不要) ---
 
 
+def test_subscription_current_period_end_prefers_top_level():
+    subscription = {"current_period_end": 1700000000, "items": {"data": [{"current_period_end": 1}]}}
+    assert billing._subscription_current_period_end(subscription) == 1700000000
+
+
+def test_subscription_current_period_end_falls_back_to_items_data():
+    # Stripe APIの一部バージョンでは、current_period_endがSubscription直下ではなく
+    # subscription.items.data[0]配下に移動している(実機確認で判明)。
+    subscription = {"items": {"data": [{"current_period_end": 1800000000}]}}
+    assert billing._subscription_current_period_end(subscription) == 1800000000
+
+
+def test_subscription_current_period_end_returns_none_when_missing():
+    assert billing._subscription_current_period_end({"items": {"data": []}}) is None
+    assert billing._subscription_current_period_end(None) is None
+
+
 def test_is_billing_enabled_false_by_default(monkeypatch):
     monkeypatch.delenv(billing.BILLING_ENABLED_ENV, raising=False)
     assert billing.is_billing_enabled() is False
