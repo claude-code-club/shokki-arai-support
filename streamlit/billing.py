@@ -80,6 +80,21 @@ def _get_price_id():
     return price_id
 
 
+def _subscription_current_period_end(subscription):
+    """current_period_endを取得する。Stripe APIの一部バージョンではSubscription直下、
+    それ以外ではsubscription.items.data[0]配下に移動しているため、両方に対応する。
+    表示用の情報であり、課金状態の判定(active/trialing)には使わない。
+    """
+    top_level = _attr(subscription, "current_period_end")
+    if top_level is not None:
+        return top_level
+    items = _attr(subscription, "items")
+    items_data = _attr(items, "data") or []
+    if items_data:
+        return _attr(items_data[0], "current_period_end")
+    return None
+
+
 def _attr(obj, name, default=None):
     """辞書(テストの偽オブジェクト)・Stripeオブジェクト(属性アクセスのみ)の両方から
     安全に値を取り出す。新しいstripeパッケージ(v15以降)のSession/Subscriptionは
@@ -155,7 +170,7 @@ def confirm_checkout_session(*, session_id, tenant_id, role, conn, stripe_client
     if _attr(metadata, "tenant_id") != str(tenant_id):
         raise TenantMismatchError("Checkout Sessionの世帯情報が一致しません。")
 
-    period_end_ts = _attr(subscription, "current_period_end")
+    period_end_ts = _subscription_current_period_end(subscription)
     current_period_end = (
         datetime.fromtimestamp(period_end_ts, tz=timezone.utc) if period_end_ts else None
     )
