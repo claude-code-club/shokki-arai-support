@@ -386,7 +386,9 @@ if get_backend_name() == "postgres":
     st.subheader("🔍 記録をさがす")
     search_col1, search_col2 = st.columns([3, 1])
     search_keyword = search_col1.text_input(
-        "キーワード(ひとことメモの一部)", key="_search_keyword"
+        "キーワード(ひとことメモの一部)",
+        key="_search_keyword",
+        max_chars=storage.KEYWORD_MAX_LENGTH,
     )
     search_order_label = search_col2.selectbox(
         "並び順", ["新しい順", "古い順"], key="_search_order"
@@ -396,6 +398,15 @@ if get_backend_name() == "postgres":
     try:
         search_results = search_records(
             tenant_id=TENANT_ID, keyword=search_keyword, order=search_order
+        )
+    except storage.InvalidInputError:
+        # 入力値そのものの問題(長さ・制御文字)。システム障害と誤解させないよう
+        # 専用の案内を出す(max_charsで上限自体は防げるが、制御文字等は別途ここで
+        # 拾う。ChatGPT監査2026-09-03、Highの指摘を反映)。
+        search_results = None
+        st.caption(
+            f"検索キーワードは{storage.KEYWORD_MAX_LENGTH}文字以内で、"
+            "制御文字を含めずに入力してください。"
         )
     except (StorageConfigError, StorageUnavailableError):
         search_results = None
