@@ -176,7 +176,7 @@ def save_dates_for_tenant(dates, conn, *, tenant_id):
             )
 
 
-# --- 第22回(検索できるDB): records.memo(SQL操作のみ、commitしない) ---
+# --- 第22課題(検索できるDB): records.memo(SQL操作のみ、commitしない) ---
 # scripts/migrate_to_records_memo_schema.py実行後(records.memo列が存在する)前提。
 
 
@@ -195,12 +195,29 @@ def record_with_memo_for_tenant(record_date, memo, conn, *, tenant_id):
         )
 
 
+def _escape_like_pattern(value):
+    """LIKE/ILIKEパターン中で特殊な意味を持つ文字(バックスラッシュ・%・_)を
+    バックスラッシュでエスケープする。
+
+    keywordにこれらの文字が含まれていても、search_records_for_tenant()が
+    「その文字列そのものをmemoの部分文字列として検索する」という利用者から見た
+    素直な挙動を保証するため(バックスラッシュ自身も先にエスケープしないと、
+    後から挿入する\\%・\\_のバックスラッシュ自体がエスケープ文字として
+    再解釈されてしまう。置換順序が重要)。
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def search_records_for_tenant(conn, *, tenant_id, keyword=None, order="desc"):
     """指定tenant_idの記録を検索する(SQL操作のみ)。
 
     keywordを指定した場合、memoの部分一致(ILIKEなので大文字小文字を区別しない)で
-    絞り込む(Noneまたは空文字なら絞り込まない)。orderは"desc"(新しい順、既定)
-    または"asc"(古い順)、それ以外はValueError。
+    絞り込む(Noneまたは空文字なら絞り込まない)。keyword中の%・_・バックスラッシュは
+    _escape_like_pattern()でエスケープしてからパターンに組み込むため、これらの文字は
+    ワイルドカードとしてではなく、常にkeywordそのものの文字として扱われる
+    (例: keyword="_"は「メモにアンダースコアを含む」だけにマッチし、
+    「メモが1文字以上ある」全件にはマッチしない)。
+    orderは"desc"(新しい順、既定)または"asc"(古い順)、それ以外はValueError。
     戻り値: [{"date": "YYYY-MM-DD", "memo": str | None}, ...] をrecord_date順に並べたリスト。
     """
     if order not in ("asc", "desc"):
@@ -210,8 +227,8 @@ def search_records_for_tenant(conn, *, tenant_id, keyword=None, order="desc"):
     sql = "SELECT record_date, memo FROM records WHERE tenant_id = %s"
     params = [tenant_id]
     if keyword:
-        sql += " AND memo ILIKE %s"
-        params.append(f"%{keyword}%")
+        sql += " AND memo ILIKE %s ESCAPE '\\'"
+        params.append(f"%{_escape_like_pattern(keyword)}%")
     sql += f" ORDER BY record_date {direction}"
 
     with conn.cursor() as cur:

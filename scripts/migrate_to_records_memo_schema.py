@@ -1,4 +1,4 @@
-"""records.memo列を追加する（第22回: 検索できるDB）。
+"""records.memo列を追加する（第22課題: 検索できるDB）。
 
 migrate_to_usage_schema.pyと同じく、ALTER TABLE ... ADD COLUMN IF NOT EXISTSに
 よる冪等な追加のみを行う。既存行はmemo=NULL（メモ無し）のまま、他の列には

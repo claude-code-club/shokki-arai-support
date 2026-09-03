@@ -257,7 +257,7 @@ def add_date_safely(record_date, memo=None):
     """記録保存時のStorageConfigError/StorageUnavailableErrorを、初回読み込み時と
     同じ一般向けの安全なメッセージで捕捉し、st.stop()する(内部エラーの詳細は画面に出さない)。
 
-    postgresバックエンドではmemoを添えて保存する(第22回: 検索できるDB)。jsonバックエンドは
+    postgresバックエンドではmemoを添えて保存する(第22課題: 検索できるDB)。jsonバックエンドは
     メモの概念を持たないため、従来通りadd_date()を使う(仕様書/検索できるDB設計.md参照)。
     """
     try:
@@ -381,7 +381,7 @@ else:
 st.caption(f"累計記録日数: {len(dates)}日")
 
 if get_backend_name() == "postgres":
-    # --- 記録の検索・並び替え(第22回: 検索できるDB、postgresバックエンド専用) ---
+    # --- 記録の検索・並び替え(第22課題: 検索できるDB、postgresバックエンド専用) ---
     st.divider()
     st.subheader("🔍 記録をさがす")
     search_col1, search_col2 = st.columns([3, 1])

@@ -77,7 +77,7 @@ KEYWORD_MAX_LENGTH = 100
 
 
 def _validate_memo(memo):
-    """記録に添えるメモの長さ・形式をサーバー側で検証する(第22回: 検索できるDB)。
+    """記録に添えるメモの長さ・形式をサーバー側で検証する(第22課題: 検索できるDB)。
 
     _validate_tenant_name()と同じ方針(空・制御文字・上限超過を拒否)だが、メモは
     任意項目のため、Noneまたは空文字はエラーにせずNone(メモ無し)として扱う。
@@ -97,7 +97,7 @@ def _validate_memo(memo):
 
 
 def _validate_search_keyword(keyword):
-    """検索キーワードの長さ・形式をサーバー側で検証する(第22回: 検索できるDB)。
+    """検索キーワードの長さ・形式をサーバー側で検証する(第22課題: 検索できるDB)。
 
     _validate_memo()と同じ方針。Noneまたは空文字は「絞り込まない」として扱う。
     """
@@ -280,7 +280,7 @@ def rename_tenant(name, tenant_id=None, role=None):
 
 
 def add_date_with_memo(record_date, memo, tenant_id=None):
-    """1件だけ原子的に記録を追加し、任意のメモを添える(第22回: 検索できるDB)。
+    """1件だけ原子的に記録を追加し、任意のメモを添える(第22課題: 検索できるDB)。
 
     add_date()のメモ対応版。メモはpostgresバックエンド専用の機能(jsonバックエンドは
     dates(日付の集合)しか持たないため、メモの概念が無い。仕様書/検索できるDB設計.md
@@ -302,7 +302,7 @@ def add_date_with_memo(record_date, memo, tenant_id=None):
 
 
 def search_records(tenant_id=None, keyword=None, order="desc"):
-    """記録をキーワード検索・並び替えする(第22回: 検索できるDB、postgresバックエンド専用)。
+    """記録をキーワード検索・並び替えする(第22課題: 検索できるDB、postgresバックエンド専用)。
 
     add_date_with_memo()と同じ理由で、jsonバックエンドではStorageConfigErrorを送出する。
     戻り値: db.search_records_for_tenant()と同じ形式のリスト。

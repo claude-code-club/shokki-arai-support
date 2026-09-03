@@ -24,7 +24,7 @@ requires_db = pytest.mark.skipif(
 @pytest.fixture
 def memo_schema():
     """稼働中のpublic.recordsとは隔離した専用スキーマに、tenants/records(第16回)＋
-    records.memo(第22回)を用意する。db.py関数を直接検証する用途。
+    records.memo(第22課題)を用意する。db.py関数を直接検証する用途。
     """
     if not db.is_configured():
         pytest.skip("DATABASE_URLが設定されていないため、PostgreSQL連携テストをスキップします")
@@ -122,6 +122,65 @@ def test_migrate_to_records_memo_schema_is_idempotent(memo_schema):
         cur.execute("SELECT memo FROM records LIMIT 0")  # 列が存在すればエラーにならない
 
 
+@requires_db
+def test_migrate_to_records_memo_schema_preserves_existing_data():
+    """既存データ(migrate_to_records_memo_schema実行前に作った記録)がある状態で
+    migrationを適用しても、既存の記録(tenant_id・record_date)が一切変更されず、
+    memo列だけがNULLで追加されることを確認する(監査項目⑥)。
+    """
+    if not db.is_configured():
+        pytest.skip("DATABASE_URLが設定されていないため、PostgreSQL連携テストをスキップします")
+
+    schema_name = f"test_memo_existing_data_{uuid.uuid4().hex}"
+    conn = db.get_connection()
+    with conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA {schema_name}")
+        cur.execute(f"SET search_path TO {schema_name}")
+    db.ensure_schema(conn)
+    tenant_id = uuid.uuid4()
+    migrate_tenant_module.migrate_to_tenant_schema(tenant_id, conn=conn)
+    conn.commit()
+
+    try:
+        # memo列が無い状態(migrate_to_records_memo_schema実行前)で既存データを作る
+        db.insert_date_for_tenant("2026-08-01", conn, tenant_id=tenant_id)
+        db.insert_date_for_tenant("2026-08-02", conn, tenant_id=tenant_id)
+        conn.commit()
+        before = db.load_dates_for_tenant(conn, tenant_id=tenant_id)
+        assert before == {"2026-08-01", "2026-08-02"}
+
+        migrate_memo_module.migrate_to_records_memo_schema(conn=conn)
+
+        # 既存2件の日付が変更されていないこと
+        after = db.load_dates_for_tenant(conn, tenant_id=tenant_id)
+        assert after == before
+
+        # 既存行はmemo=NULLのまま、新しいsearch_records_for_tenant()で読めること
+        results = db.search_records_for_tenant(conn, tenant_id=tenant_id, order="asc")
+        assert results == [
+            {"date": "2026-08-01", "memo": None},
+            {"date": "2026-08-02", "memo": None},
+        ]
+
+        # migration後、既存行にmemoを後から追記できること
+        db.record_with_memo_for_tenant(
+            "2026-08-01", "後から追記したメモ", conn, tenant_id=tenant_id
+        )
+        conn.commit()
+        results2 = db.search_records_for_tenant(conn, tenant_id=tenant_id, order="asc")
+        assert results2[0] == {"date": "2026-08-01", "memo": "後から追記したメモ"}
+    finally:
+        conn.rollback()
+        conn.close()
+        cleanup_conn = db.get_connection()
+        try:
+            with cleanup_conn.cursor() as cur:
+                cur.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE")
+            cleanup_conn.commit()
+        finally:
+            cleanup_conn.close()
+
+
 # --- db.record_with_memo_for_tenant() ---
 
 
@@ -209,6 +268,62 @@ def test_search_records_keyword_is_case_insensitive(memo_schema):
     conn.commit()
 
     results = db.search_records_for_tenant(conn, tenant_id=tenant_id, keyword="dishwasher")
+    assert [r["date"] for r in results] == ["2026-09-01"]
+
+
+# --- db.search_records_for_tenant(): 特殊文字(SQL LIKEワイルドカードの漏れ防止、監査項目⑦) ---
+
+
+@requires_db
+def test_search_records_keyword_percent_is_treated_literally(memo_schema):
+    """keyword="%"はSQL LIKEのワイルドカードとしてではなく、memoに実際に
+    "%"という文字が含まれる記録だけにマッチする(全件マッチしない)ことを確認する。
+    """
+    conn, tenant_id = memo_schema
+    db.record_with_memo_for_tenant("2026-09-01", "10%オフだった", conn, tenant_id=tenant_id)
+    db.record_with_memo_for_tenant("2026-09-02", "割引なし", conn, tenant_id=tenant_id)
+    conn.commit()
+
+    results = db.search_records_for_tenant(conn, tenant_id=tenant_id, keyword="%")
+    assert [r["date"] for r in results] == ["2026-09-01"]
+
+
+@requires_db
+def test_search_records_keyword_underscore_is_treated_literally(memo_schema):
+    """keyword="_"はSQL LIKEの単一文字ワイルドカードとしてではなく、memoに
+    実際に"_"という文字が含まれる記録だけにマッチする(全件マッチしない)ことを確認する。
+    """
+    conn, tenant_id = memo_schema
+    db.record_with_memo_for_tenant("2026-09-01", "under_score_here", conn, tenant_id=tenant_id)
+    db.record_with_memo_for_tenant("2026-09-02", "no special chars", conn, tenant_id=tenant_id)
+    conn.commit()
+
+    results = db.search_records_for_tenant(conn, tenant_id=tenant_id, keyword="_")
+    assert [r["date"] for r in results] == ["2026-09-01"]
+
+
+@requires_db
+def test_search_records_keyword_backslash_is_treated_literally(memo_schema):
+    conn, tenant_id = memo_schema
+    db.record_with_memo_for_tenant("2026-09-01", "back\\slash", conn, tenant_id=tenant_id)
+    db.record_with_memo_for_tenant("2026-09-02", "no backslash", conn, tenant_id=tenant_id)
+    conn.commit()
+
+    results = db.search_records_for_tenant(conn, tenant_id=tenant_id, keyword="\\")
+    assert [r["date"] for r in results] == ["2026-09-01"]
+
+
+@requires_db
+def test_search_records_keyword_percent_does_not_match_unrelated_records(memo_schema):
+    """keyword="50%"のような具体的な文字列でも、"%"が正しく文字通り扱われ、
+    無関係な記録を誤ってマッチさせないことを確認する。
+    """
+    conn, tenant_id = memo_schema
+    db.record_with_memo_for_tenant("2026-09-01", "ちょうど50%引きだった", conn, tenant_id=tenant_id)
+    db.record_with_memo_for_tenant("2026-09-02", "500円引きだった", conn, tenant_id=tenant_id)
+    conn.commit()
+
+    results = db.search_records_for_tenant(conn, tenant_id=tenant_id, keyword="50%")
     assert [r["date"] for r in results] == ["2026-09-01"]
 
 
@@ -341,3 +456,38 @@ def test_add_date_with_memo_requires_tenant_id_on_postgres(memo_env):
 def test_search_records_requires_tenant_id_on_postgres(memo_env):
     with pytest.raises(storage.StorageConfigError):
         storage.search_records(tenant_id=None)
+
+
+@requires_db
+def test_search_records_empty_keyword_via_storage_returns_all(memo_env):
+    """空文字のkeywordは絞り込みとして扱われず、全件返す(監査項目⑦)。"""
+    tenant_id = memo_env
+    storage.add_date_with_memo("2026-09-01", "何かメモ", tenant_id=tenant_id)
+
+    results = storage.search_records(tenant_id=tenant_id, keyword="")
+    assert results == [{"date": "2026-09-01", "memo": "何かメモ"}]
+
+
+@requires_db
+def test_search_records_via_storage_does_not_leak_other_tenant(memo_env):
+    """storage層(app.pyから実際に呼ばれる関数)でも、世帯Aのメモ・検索結果に
+    世帯Bの記録が一切混ざらないことを確認する(db.py層の検証に加えて、
+    storage層でも同じ性質が保たれていることの二重確認。監査項目⑧)。
+    """
+    tenant_id = memo_env
+    conn = db.get_connection()  # memo_envによりこのスキーマへ固定済み
+    try:
+        with conn.cursor() as cur:
+            other_id = uuid.uuid4()
+            cur.execute("INSERT INTO tenants (id, name) VALUES (%s, %s)", (other_id, "別世帯"))
+        conn.commit()
+    finally:
+        conn.close()
+
+    storage.add_date_with_memo("2026-09-01", "世帯Aのメモ", tenant_id=tenant_id)
+    storage.add_date_with_memo("2026-09-01", "世帯Bのメモ", tenant_id=other_id)
+
+    results_a = storage.search_records(tenant_id=tenant_id)
+    results_b = storage.search_records(tenant_id=other_id)
+    assert results_a == [{"date": "2026-09-01", "memo": "世帯Aのメモ"}]
+    assert results_b == [{"date": "2026-09-01", "memo": "世帯Bのメモ"}]
