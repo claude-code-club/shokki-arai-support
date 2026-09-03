@@ -159,7 +159,7 @@ ALTER TABLE public.records DROP COLUMN IF EXISTS memo;
 
 ## ⑦テスト
 
-`tests/test_records_search.py`(39件)。
+`tests/test_records_search.py`(37件)。
 
 - スキーマ分離(`CREATE SCHEMA test_x/SET search_path`)で検証するもの:
   `db.record_with_memo_for_tenant()`・`search_records_for_tenant()`(新規追加・
