@@ -101,8 +101,41 @@ memo列を参照する)のどちらよりも前に実行するよう`main()`を�
 - PR #30(検索できるDB、`feature/records-memo-search`): 既存202件+新規37件=239件
 
 いずれもPostgreSQL 16・18双方の実機(ローカルのポータブル環境)で全PASSを
-確認済み。stagingへは一切接続していない。両ブランチを実際に統合した状態
-(マージ後)での実機確認は別途行う(下記「両ブランチ統合後の実機確認」参照)。
+確認済み。stagingへは一切接続していない。
+
+### 両ブランチ統合後の実機確認(2026-09-04実施)
+
+ローカルで`feature/least-privilege-postgres-schema`から`integration/pr29-
+pr30-test`という一時ブランチを作成し、`feature/records-memo-search`を
+実際に`git merge`した(このブランチはローカル検証専用で、origin へは
+一切pushしていない。検証後に削除済み)。
+
+- **マージ結果**: `scripts/target_identity.py`(round 2でPR #30側にも
+  バイト単位で同一の内容を配置済み)を含め、**無編集で自動マージ成功
+  (`Merge made by the 'ort' strategy`、コンフリクト0件)**。
+  「diffで内容が同一と確認」だけでなく、実際の`git merge`コマンドの
+  結果で確認した
+- **テストスイート**: 既存202件+PR #29の16件+PR #30の37件=**255件、
+  全PASS**(マージ後の統合状態で、両PRのテストが互いに干渉しないことを確認)
+- **app_runtimeとしての実測**(このセクションの核心): 使い捨てデータベースに
+  `migrate_to_least_privilege_schema.py`を実行(ロール作成・GRANT・RLS・
+  14関数すべて適用)したうえで、`DATABASE_URL`を`app_runtime`ロール
+  (パスワード認証、スーパーユーザーではない)へ切り替え、`streamlit/db.py`の
+  実関数`record_with_memo_for_tenant()`・`search_records_for_tenant()`
+  (PR #30がPostgreSQL関数呼び出しへ切り替えた後のコード)をそのまま
+  Pythonから呼び出した。結果:
+  - `SELECT current_user`が`app_runtime`であることを確認したうえで実行
+  - 世帯A・世帯Bそれぞれにメモ付きで記録を保存 → 成功
+  - 世帯Aの検索結果に世帯Bのメモが含まれない(逆も同様)ことを確認 →
+    世帯分離(RLS)が最小権限下で機能
+  - `素のSQLで直接public.recordsへアクセスしようとした場合は拒否される`
+    (`tests/test_least_privilege_schema.py::
+    test_app_runtime_cannot_query_records_table_directly`で別途確認済み)ことと
+    合わせ、「app_runtimeはEXECUTE権限だけでmemo保存・検索ができ、
+    直接のテーブルアクセスはできない」という設計どおりの状態を実測で確認した
+
+この実測により、監査項目⑪(PR #29適用後にPR #30のメモ機能が動かなくなる
+不整合)は**解消されたことを実機で確認済み**。
 
 **この改訂の背景(第12次)**: 第11次改訂版の監査資料ZIPを岩瀬様が実物監査
 した結果、**「異常時(クロスDB依存・記録欠落・最終状態不一致等)でも
