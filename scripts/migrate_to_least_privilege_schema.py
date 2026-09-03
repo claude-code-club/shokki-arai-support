@@ -9,6 +9,10 @@ import psycopg  # noqa: E402
 
 import db  # noqa: E402
 from target_identity import TargetDatabaseMismatchError, verify_target_database_identity  # noqa: E402
+from migrate_to_records_memo_schema import (  # noqa: E402
+    UnexpectedColumnDefinitionError,
+    ensure_records_memo_column,
+)
 from least_privilege_lib import (  # noqa: E402
     MissingPasswordError,
     RoleAttributeMismatchError,
@@ -39,6 +43,11 @@ def main():
             verify_or_set_login_role_password(cur, "app_webhook", app_webhook_password)
 
             grant_schema_usage(cur)  # 6-0章
+            # 第22課題(検索できるDB)との統合対応(案A): grant_table_privileges()自体が
+            # GRANT UPDATE (memo) ON public.records を含み、record_with_memo_for_tenant()・
+            # search_records_for_tenant()の関数定義もrecords.memo列を参照するため、
+            # memo列はgrant_table_privileges・関数作成のどちらよりも先に用意する。
+            ensure_records_memo_column(cur)
             grant_table_privileges(cur)  # 6-1章
             create_or_replace_functions(cur)  # 5章
             reassign_function_owners(cur)  # 訂正: GRANTリセット・ACL検証より前に行う
@@ -49,7 +58,8 @@ def main():
         print("[OK] 最小権限化スキーマの適用が完了しました。")
         return 0
     except (psycopg.Error, RoleAttributeMismatchError, UnexpectedGranteeError,
-            MissingPasswordError, TargetDatabaseMismatchError) as e:
+            MissingPasswordError, TargetDatabaseMismatchError,
+            UnexpectedColumnDefinitionError) as e:
         conn.rollback()
         print(f"[NG] 適用中にエラーが発生しました。変更はロールバックされました: {type(e).__name__}: {e}")
         return 1

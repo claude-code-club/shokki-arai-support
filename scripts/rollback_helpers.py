@@ -1,10 +1,17 @@
-"""設計書17-0章(第13次改訂版)をそのまま実装。"""
+"""設計書17-0章(第13次改訂版)をそのまま実装。
+
+第22課題(検索できるDB、PR #30)との統合対応(案A、2026-09-04)により、
+record_with_memo_for_tenant()・search_records_for_tenant()を関数一覧・
+EXECUTE取消対象へ追加している(12関数→14関数)。
+"""
 import hashlib
 import json
 import os
 from pathlib import Path
 
 from psycopg import sql
+
+from memo_search_functions import MEMO_SEARCH_FUNCTION_SIGNATURES
 
 CONSTRAINT_NAME = "tenant_subscriptions_stripe_subscription_id_key"
 MIGRATION_NAME = "stripe_subscription_id_unique_schema"
@@ -16,7 +23,7 @@ EXPECTED_TABLE_NAMES = {
 }
 EXPECTED_SEQUENCE_NAMES = {"records_id_seq"}
 
-TEN_APP_DATA_OWNER_FUNCTION_SIGNATURES = [
+APP_DATA_OWNER_FUNCTION_SIGNATURES = [
     "load_dates_for_tenant(uuid)",
     "insert_date_for_tenant(uuid, date)",
     "delete_date_for_tenant(uuid, date)",
@@ -27,8 +34,8 @@ TEN_APP_DATA_OWNER_FUNCTION_SIGNATURES = [
     "get_tenant_usage_count(uuid, text, date)",
     "increment_tenant_usage_if_under_limit(uuid, text, date, integer)",
     "mark_stripe_event_processed(text, text)",
-]
-ALL_TWELVE_FUNCTION_SIGNATURES = TEN_APP_DATA_OWNER_FUNCTION_SIGNATURES + [
+] + MEMO_SEARCH_FUNCTION_SIGNATURES
+ALL_FUNCTION_SIGNATURES = APP_DATA_OWNER_FUNCTION_SIGNATURES + [
     "resolve_login(text, text, boolean)",
     "find_tenant_id_by_subscription(text)",
 ]
@@ -46,6 +53,8 @@ EXECUTE_REVOKE_TARGETS = [
     ("get_tenant_usage_count(uuid, text, date)", ["app_runtime"]),
     ("increment_tenant_usage_if_under_limit(uuid, text, date, integer)", ["app_runtime"]),
     ("mark_stripe_event_processed(text, text)", ["app_webhook"]),
+    ("record_with_memo_for_tenant(uuid, date, text)", ["app_runtime"]),
+    ("search_records_for_tenant(uuid, text, text)", ["app_runtime"]),
 ]
 
 
@@ -290,7 +299,7 @@ def _remove_roles_and_rls(cur):
     # (least_privilege_lib.pyのADMIN_OWNER解決と同じ考え方)
     cur.execute("SELECT current_user")
     admin_owner = cur.fetchone()[0]
-    for signature in TEN_APP_DATA_OWNER_FUNCTION_SIGNATURES:
+    for signature in APP_DATA_OWNER_FUNCTION_SIGNATURES:
         cur.execute(
             sql.SQL("ALTER FUNCTION public.{signature} OWNER TO {owner}").format(
                 signature=sql.SQL(signature), owner=sql.Identifier(admin_owner)
@@ -298,6 +307,7 @@ def _remove_roles_and_rls(cur):
         )
 
     cur.execute("REVOKE SELECT, INSERT, DELETE ON public.records FROM app_data_owner")
+    cur.execute("REVOKE UPDATE (memo) ON public.records FROM app_data_owner")
     cur.execute("REVOKE USAGE ON public.records_id_seq FROM app_data_owner")
     cur.execute("REVOKE SELECT (id), UPDATE (name) ON public.tenants FROM app_data_owner")
     cur.execute("REVOKE SELECT, INSERT, UPDATE ON public.tenant_subscriptions FROM app_data_owner")
@@ -346,10 +356,10 @@ def _count_existing_functions(cur, signatures):
 
 
 def _drop_all_functions(cur):
-    before_count = _count_existing_functions(cur, ALL_TWELVE_FUNCTION_SIGNATURES)
-    for signature in ALL_TWELVE_FUNCTION_SIGNATURES:
+    before_count = _count_existing_functions(cur, ALL_FUNCTION_SIGNATURES)
+    for signature in ALL_FUNCTION_SIGNATURES:
         cur.execute(f"DROP FUNCTION IF EXISTS public.{signature}")
-    after_count = _count_existing_functions(cur, ALL_TWELVE_FUNCTION_SIGNATURES)
+    after_count = _count_existing_functions(cur, ALL_FUNCTION_SIGNATURES)
     return {"before_function_count": before_count, "after_function_count": after_count}
 
 

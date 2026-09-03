@@ -1,9 +1,19 @@
 """設計書4〜7章・16章の内容をそのまま実装したライブラリ。
 scripts/migrate_to_least_privilege_schema.py から呼ばれる。
+
+第22課題(検索できるDB、PR #30)との統合対応(案A、2026-09-04)により、
+scripts/memo_search_functions.pyのrecord_with_memo_for_tenant()・
+search_records_for_tenant()を関数一覧・GRANT・検証へ追加している
+(12関数→14関数)。
 """
 import os
 
 from psycopg import sql
+
+from memo_search_functions import (
+    MEMO_SEARCH_FUNCTION_DEFINITIONS,
+    MEMO_SEARCH_FUNCTION_SIGNATURES,
+)
 
 # ---- 4-2章 -----------------------------------------------------------
 
@@ -139,6 +149,10 @@ def grant_schema_usage(cur):
 
 def grant_table_privileges(cur):
     cur.execute("GRANT SELECT, INSERT, DELETE ON public.records TO app_data_owner")
+    # record_with_memo_for_tenant()のON CONFLICT DO UPDATE SET memo = ...が
+    # 必要とする(第22課題との統合対応、案A)。列単位でmemoのみに限定し、
+    # tenant_id・record_dateの更新はDELETE+INSERTの原子性で行う既存方針を保つ。
+    cur.execute("GRANT UPDATE (memo) ON public.records TO app_data_owner")
     cur.execute("GRANT USAGE ON public.records_id_seq TO app_data_owner")
     cur.execute("GRANT SELECT (id), UPDATE (name) ON public.tenants TO app_data_owner")
     cur.execute("GRANT SELECT, INSERT, UPDATE ON public.tenant_subscriptions TO app_data_owner")
@@ -348,7 +362,7 @@ FUNCTION_DEFINITIONS = [
     END;
     $$;
     """,
-]
+] + MEMO_SEARCH_FUNCTION_DEFINITIONS
 
 
 def create_or_replace_functions(cur):
@@ -356,7 +370,7 @@ def create_or_replace_functions(cur):
         cur.execute(definition)
 
 
-TEN_APP_DATA_OWNER_FUNCTION_SIGNATURES = [
+APP_DATA_OWNER_FUNCTION_SIGNATURES = [
     "load_dates_for_tenant(uuid)",
     "insert_date_for_tenant(uuid, date)",
     "delete_date_for_tenant(uuid, date)",
@@ -367,16 +381,16 @@ TEN_APP_DATA_OWNER_FUNCTION_SIGNATURES = [
     "get_tenant_usage_count(uuid, text, date)",
     "increment_tenant_usage_if_under_limit(uuid, text, date, integer)",
     "mark_stripe_event_processed(text, text)",
-]
+] + MEMO_SEARCH_FUNCTION_SIGNATURES
 
-ALL_TWELVE_FUNCTION_SIGNATURES = TEN_APP_DATA_OWNER_FUNCTION_SIGNATURES + [
+ALL_FUNCTION_SIGNATURES = APP_DATA_OWNER_FUNCTION_SIGNATURES + [
     "resolve_login(text, text, boolean)",
     "find_tenant_id_by_subscription(text)",
 ]
 
 
 def reassign_function_owners(cur):
-    for signature in TEN_APP_DATA_OWNER_FUNCTION_SIGNATURES:
+    for signature in APP_DATA_OWNER_FUNCTION_SIGNATURES:
         cur.execute(f"ALTER FUNCTION public.{signature} OWNER TO app_data_owner")
 
 
@@ -396,6 +410,8 @@ RESET_AND_GRANT_STATEMENTS = [
     ("get_tenant_usage_count(uuid, text, date)", ["app_runtime"]),
     ("increment_tenant_usage_if_under_limit(uuid, text, date, integer)", ["app_runtime"]),
     ("mark_stripe_event_processed(text, text)", ["app_webhook"]),
+    ("record_with_memo_for_tenant(uuid, date, text)", ["app_runtime"]),
+    ("search_records_for_tenant(uuid, text, text)", ["app_runtime"]),
 ]
 
 
@@ -435,6 +451,8 @@ EXPECTED_FUNCTION_GRANTS = [
         "app_data_owner", {"app_runtime"},
     ),
     ("public.mark_stripe_event_processed(text, text)", "app_data_owner", {"app_webhook"}),
+    ("public.record_with_memo_for_tenant(uuid, date, text)", "app_data_owner", {"app_runtime"}),
+    ("public.search_records_for_tenant(uuid, text, text)", "app_data_owner", {"app_runtime"}),
 ]
 
 

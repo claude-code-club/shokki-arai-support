@@ -35,6 +35,75 @@ commit・push・PR作成・デプロイのいずれも未実施。岩瀬様・Ch
 すべてPostgreSQL 16・18の実機で45項目を再検証し、全項目PASSした。
 詳細は監査ZIP(第13次)を参照。
 
+## ★統合追記(案A、2026-09-04): 第22課題「検索できるDB」(PR #30)との統合
+
+**背景**: 第13次改訂版の設計承認後、実装フェーズでPR #29(この設計書)と並行して
+PR #30(第22課題、記録へのメモ保存・キーワード検索・並び替え)が実装された。
+PR #30の監査(ChatGPT、2026-09-03〜04)で、**PR #29の権限ロックダウンを適用すると
+PR #30のメモ保存・検索機能が動かなくなる**という不整合が指摘された(監査ZIP
+`PR30_audit_20260904_round2.zip`項目⑪)。理由: `app_runtime`ロールは
+`records`テーブルへの直接GRANTを持たず、この設計書が定義するSECURITY DEFINER
+関数のEXECUTE権限のみで動作する設計だが、PR #30が新設した2つのdb.py関数
+(`record_with_memo_for_tenant`・`search_records_for_tenant`)は素のSQLで
+`records`へ直接アクセスしており、この関数一覧に含まれていなかった。
+
+**採用した対応方針(案A)**: 新設対応の責務をこの設計書(PR #29)側に統合する。
+PR #30側は素のSQLをやめ、この設計書が新設する2つのSECURITY DEFINER関数を
+呼ぶ形へ変更した(`streamlit/db.py`)。
+
+**追加した2関数**(既存12関数と同じ設計方針: `LANGUAGE plpgsql SECURITY
+DEFINER SET search_path = ''`、`pg_catalog.set_config('app.tenant_id', ...)`
+でRLSと連動、`app_data_owner`所有・`app_runtime`のみへEXECUTE付与)。
+定義の実体は`scripts/memo_search_functions.py`(PR #29・PR #30の両ブランチへ
+バイト単位で同一の内容を配置、この設計書の§5関数一覧とは別ファイルとして
+一元管理する。理由: PR #30側のテストからも同じ定義を再利用するため)。
+
+| 関数 | 所有者 | EXECUTE付与先 | 概要 |
+|---|---|---|---|
+| `record_with_memo_for_tenant(uuid, date, text)` | app_data_owner | app_runtime | 記録日を追加し任意のメモを添える(`ON CONFLICT DO UPDATE SET memo = ...`) |
+| `search_records_for_tenant(uuid, text, text)` | app_data_owner | app_runtime | 記録を検索(キーワードの部分一致・`%`/`_`/バックスラッシュのLIKEエスケープを関数内で実施・大文字小文字を区別しない)、新しい順/古い順で返す |
+
+**関数総数: 12関数→14関数**(以降、この設計書の他セクションにある「12関数」・
+「全12関数」という記述は、この統合追記より前(第13次改訂版まで)の状態を
+指す歴史的記録であり、現在の正しい総数は14関数)。`APP_DATA_OWNER_FUNCTION_
+SIGNATURES`(旧`TEN_APP_DATA_OWNER_FUNCTION_SIGNATURES`)・`ALL_FUNCTION_
+SIGNATURES`(旧`ALL_TWELVE_FUNCTION_SIGNATURES`)へ改名した(件数が10・12
+固定でなくなったため)。
+
+**実装中に発見した追加のバグ(設計未検出)**: `record_with_memo_for_tenant`の
+`ON CONFLICT DO UPDATE SET memo = ...`は、INSERTだけでなく**UPDATE権限**を
+必要とする。既存の`grant_table_privileges()`は`records`へ`SELECT, INSERT,
+DELETE`しか付与しておらず(既存11関数はいずれも`records`へのUPDATE操作を
+行わないため、この設計の第1〜13次改訂でも一度も必要にならなかった)、
+実機で`app_runtime`として関数を呼び出すテストを追加して初めて
+`InsufficientPrivilege`(`permission denied for table records`)を検出した。
+`GRANT UPDATE (memo) ON public.records TO app_data_owner`(列単位、
+`tenant_id`・`record_date`は含めない)を追加して解決。ロールバック
+(`rollback_helpers.py`)にも対応する`REVOKE UPDATE (memo) ...`を追加した。
+**教訓**: ACL検証(`verify_all_function_grants`)は「関数のEXECUTE権限」しか
+見ておらず、「関数の中身が実際にどのテーブル操作を必要とし、それに見合う
+テーブル権限が揃っているか」は静的検証の対象外だった。実際に対象ロールで
+関数を呼び出す実機テスト(`test_memo_search_functions_work_as_app_runtime_
+and_isolate_tenants`)を追加して初めて発覚した——ACL検証と実行時テストは
+どちらか一方では不十分で、両方が必要という教訓が再確認された。
+
+**main()の実行順序への影響**: `ensure_records_memo_column()`
+(`scripts/migrate_to_records_memo_schema.py`、PR #30由来、PR #29へも
+バイト単位で同一の内容を配置)を、`grant_table_privileges()`(UPDATE (memo)
+のGRANT文がmemo列を参照する)・`create_or_replace_functions()`(関数定義が
+memo列を参照する)のどちらよりも前に実行するよう`main()`を変更した。
+
+**検証**(PR #29・PR #30はまだgit上マージされておらず、それぞれ独立した
+ブランチのため合算した件数は存在しない。各ブランチ単独での確認結果):
+
+- PR #29(この設計書、`feature/least-privilege-postgres-schema`): 既存202件+
+  この設計書のテスト16件(既存14件+今回追加2件)=218件
+- PR #30(検索できるDB、`feature/records-memo-search`): 既存202件+新規37件=239件
+
+いずれもPostgreSQL 16・18双方の実機(ローカルのポータブル環境)で全PASSを
+確認済み。stagingへは一切接続していない。両ブランチを実際に統合した状態
+(マージ後)での実機確認は別途行う(下記「両ブランチ統合後の実機確認」参照)。
+
 **この改訂の背景(第12次)**: 第11次改訂版の監査資料ZIPを岩瀬様が実物監査
 した結果、**「異常時(クロスDB依存・記録欠落・最終状態不一致等)でも
 処理を続行し、`[OK]`や終了コード0で成功扱いにしてしまう」という重大な

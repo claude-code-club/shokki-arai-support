@@ -142,6 +142,11 @@ def _identity_env(dbname, project_id="ci-test-project", environment_id="ci-test-
 def _run_script(script_name, dbname, extra_env=None):
     env = os.environ.copy()
     env["DATABASE_URL"] = _database_url_for(dbname)
+    # スクリプトの[OK]/[NG]メッセージは日本語を含むため、コンソールの既定
+    # コードページがUTF-8でない環境でもsubprocess側の出力を確実にUTF-8として
+    # デコードできるよう明示する(tests/test_records_search.pyの
+    # _run_migrate_memo_script()と同じ対応)。
+    env["PYTHONIOENCODING"] = "utf-8"
     if extra_env:
         env.update(extra_env)
     proc = subprocess.run(
@@ -337,6 +342,67 @@ class TestLeastPrivilegeMigration:
                 rows = cur.fetchall()
             conn.rollback()
         assert {str(r[0]) for r in rows} == {str(tenant_a)}
+
+    def test_memo_search_functions_work_as_app_runtime_and_isolate_tenants(self, lp_db):
+        """第22課題(検索できるDB、PR #30)との統合対応(案A)。app_runtimeとして
+        接続し、record_with_memo_for_tenant()・search_records_for_tenant()を
+        実際に呼び出し、保存・検索・世帯分離が最小権限下で機能することを実測する
+        (項目⑪で指摘された不整合の解消を検証する回帰テスト)。
+        """
+        _build_full_state(lp_db)
+        parts = _connection_parts()
+
+        with psycopg.connect(dbname=lp_db, **parts) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.tenants (id, name) VALUES (gen_random_uuid(), 'A') RETURNING id"
+                )
+                tenant_a = cur.fetchone()[0]
+                cur.execute(
+                    "INSERT INTO public.tenants (id, name) VALUES (gen_random_uuid(), 'B') RETURNING id"
+                )
+                tenant_b = cur.fetchone()[0]
+            conn.commit()
+
+        with psycopg.connect(dbname=lp_db, **parts) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET ROLE app_runtime")
+                cur.execute(
+                    "SELECT public.record_with_memo_for_tenant(%s, %s, %s)",
+                    (tenant_a, "2026-09-01", "世帯Aのメモ"),
+                )
+                cur.execute(
+                    "SELECT public.record_with_memo_for_tenant(%s, %s, %s)",
+                    (tenant_b, "2026-09-01", "世帯Bのメモ"),
+                )
+                cur.execute(
+                    "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
+                    (tenant_a, None, "desc"),
+                )
+                rows_a = cur.fetchall()
+                cur.execute(
+                    "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
+                    (tenant_b, None, "desc"),
+                )
+                rows_b = cur.fetchall()
+            conn.commit()
+
+        assert [(r[0].isoformat(), r[1]) for r in rows_a] == [("2026-09-01", "世帯Aのメモ")]
+        assert [(r[0].isoformat(), r[1]) for r in rows_b] == [("2026-09-01", "世帯Bのメモ")]
+
+    def test_app_runtime_cannot_query_records_table_directly(self, lp_db):
+        """app_runtimeはrecordsテーブルへの直接GRANTを持たず、SECURITY DEFINER
+        関数のEXECUTE権限だけでmemo保存・検索ができることの裏付け(素のSQLでの
+        直接アクセスは拒否されることを確認する)。
+        """
+        _build_full_state(lp_db)
+        parts = _connection_parts()
+        with psycopg.connect(dbname=lp_db, **parts) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET ROLE app_runtime")
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    cur.execute("SELECT * FROM public.records")
+            conn.rollback()
 
 
 @requires_db
