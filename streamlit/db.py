@@ -176,6 +176,49 @@ def save_dates_for_tenant(dates, conn, *, tenant_id):
             )
 
 
+# --- 第22回(検索できるDB): records.memo(SQL操作のみ、commitしない) ---
+# scripts/migrate_to_records_memo_schema.py実行後(records.memo列が存在する)前提。
+
+
+def record_with_memo_for_tenant(record_date, memo, conn, *, tenant_id):
+    """指定tenant_idの記録日を追加し、任意のメモを添える(SQL操作のみ)。
+
+    既に同じ日付の記録が存在する場合は、日付には触れずmemoだけを上書きする
+    (insert_date_for_tenant()と同じ冪等な追加に、更新できる余地を持たせたもの)。
+    memoにNoneを渡すとNULL(メモ無し)で保存する。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO records (tenant_id, record_date, memo) VALUES (%s, %s, %s) "
+            "ON CONFLICT (tenant_id, record_date) DO UPDATE SET memo = EXCLUDED.memo",
+            (tenant_id, record_date, memo),
+        )
+
+
+def search_records_for_tenant(conn, *, tenant_id, keyword=None, order="desc"):
+    """指定tenant_idの記録を検索する(SQL操作のみ)。
+
+    keywordを指定した場合、memoの部分一致(ILIKEなので大文字小文字を区別しない)で
+    絞り込む(Noneまたは空文字なら絞り込まない)。orderは"desc"(新しい順、既定)
+    または"asc"(古い順)、それ以外はValueError。
+    戻り値: [{"date": "YYYY-MM-DD", "memo": str | None}, ...] をrecord_date順に並べたリスト。
+    """
+    if order not in ("asc", "desc"):
+        raise ValueError(f"orderは'asc'または'desc'で指定してください: {order!r}")
+    direction = "ASC" if order == "asc" else "DESC"
+
+    sql = "SELECT record_date, memo FROM records WHERE tenant_id = %s"
+    params = [tenant_id]
+    if keyword:
+        sql += " AND memo ILIKE %s"
+        params.append(f"%{keyword}%")
+    sql += f" ORDER BY record_date {direction}"
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return [{"date": row[0].isoformat(), "memo": row[1]} for row in cur.fetchall()]
+
+
 def compare_date_sets(json_dates, db_dates):
     """2つの日付集合(set[str])を比較し、完全一致するかと差分を返す。
 
