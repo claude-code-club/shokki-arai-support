@@ -40,6 +40,21 @@ migrationとも停止していた**。
 あわせて、監査資料作成の過程で見つかった実バグ(検索キーワードの`%`・`_`が
 SQL LIKEワイルドカードとして漏れる)も別途修正済み(④参照)。
 
+**★round 3(2026-09-04、案A統合後の監査)**: PR #29との統合(案A)後、
+「現時点ではマージ・staging適用を承認できない」との判定でCritical 1件・
+High 3件・Medium 1件の指摘を受け、すべて対応済み。
+
+| # | 深刻度 | 指摘内容 | 対応 |
+|---|---|---|---|
+| 1 | Critical | 案A統合後、`streamlit/db.py`が呼ぶ2関数はPR #29のmigrationが作るため、round 1の「PR #30単独migration→マージ」の順序ではUndefinedFunctionで失敗する | ⑥を全面訂正。「①PR #29マージ→②③least_privilege_schema.py実行→④確認→⑤PR #30マージ→⑥確認→⑦app_runtime切替」の順序へ。`migrate_to_records_memo_schema.py`単独実行はローカル検証専用と明記 |
+| 2 | High | SECURITY DEFINER関数自身にメモ・検索語の長さ/制御文字の検証が無く、Python層を経由しない直接呼び出しで素通りする | `scripts/memo_search_functions.py`に長さ(200/100文字)・制御文字の検証を追加(SQLSTATE 22023) |
+| 3 | High | `search_records_for_tenant`の`p_order`検証が`NOT IN`のみで、`p_order=NULL`がSQLの3値論理により素通りし順序未保証の検索が成功する | `IS NULL OR`を追加して修正 |
+| 4 | High | 設計書(PR #29側)に第13次改訂版(12関数)時点の実行可能コードが「過去版」と明示されず残っていた | PR #29側の設計書§5・§6・§16・§17に正本(`scripts/*.py`)を参照する警告を追加、§5-7・§6-1は14関数版へ更新 |
+| 5 | Medium | `memo_search_functions.py`のdocstringに「memo列が無いとCREATE FUNCTION自体が失敗する」という誤った説明があった | 実機で「CREATE成功・呼び出し時にUndefinedColumn」であることを確認し、docstringを訂正 |
+
+詳細は`仕様書/PostgreSQL最小権限化・RLS設計.md`の「★round 3統合監査対応」
+セクションも参照(項目1・4はPR #29側が主担当)。
+
 ## ③DB設計
 
 ```sql
@@ -61,19 +76,33 @@ ALTER TABLE public.records ADD COLUMN IF NOT EXISTS memo TEXT;
 
 ## ④関数設計
 
+**★round 3で更新(2026-09-04、案A統合)**: PostgreSQL最小権限化
+(`仕様書/PostgreSQL最小権限化・RLS設計.md`)との統合により、以下の2関数は
+素のSQLではなく、PostgreSQL側のSECURITY DEFINER関数
+(`public.record_with_memo_for_tenant`・`public.search_records_for_tenant`、
+定義は`scripts/memo_search_functions.py`、PR #29の関数一覧へ追加済み)を
+呼ぶ形へ変更されている。この2関数は`app_runtime`ロールにEXECUTE権限のみで
+呼び出せる(`records`テーブルへの直接GRANTを持たない)ため、将来アプリの
+接続ロールが`app_runtime`へ切り替わっても動作する。keywordのLIKEエスケープ・
+orderの検証・**メモ200文字/検索語100文字の長さ制限・制御文字の拒否**は
+PG関数側で行う(呼び出し元のPython層を信頼しない設計。ChatGPT監査round 3
+Highの指摘を反映し、長さ・制御文字の検証をDB関数側にも追加した)。
+
 `streamlit/db.py`(SQL操作のみ、commitしない):
 
 - `record_with_memo_for_tenant(record_date, memo, conn, *, tenant_id)` —
-  記録日を追加し、任意のメモを添える。既に同じ日付の記録が存在する場合は
-  memoだけを上書きする(`insert_date_for_tenant()`と同じ冪等な追加に、
-  更新できる余地を持たせたもの)
+  `SELECT public.record_with_memo_for_tenant(%s, %s, %s)`を呼ぶ。既に
+  同じ日付の記録が存在する場合はmemoだけを上書きする(PG関数側の
+  `ON CONFLICT DO UPDATE`)
 - `search_records_for_tenant(conn, *, tenant_id, keyword=None, order="desc")` —
-  記録を検索する。keyword指定時はmemoの部分一致(`ILIKE`、大文字小文字を区別しない)
-  で絞り込む。orderは`"desc"`(新しい順、既定)または`"asc"`(古い順)。
-  keywordに含まれる`%`・`_`・バックスラッシュは`_escape_like_pattern()`で
-  エスケープしてからパターンに組み込むため、これらの文字はSQL LIKEワイルドカード
-  としてではなく、常にkeywordそのものの文字として扱われる(修正前は
-  `keyword="_"`がほぼ全件にマッチしてしまうバグがあった)
+  `SELECT ... FROM public.search_records_for_tenant(%s, %s, %s)`を呼ぶ。
+  orderは`"desc"`(新しい順、既定)または`"asc"`(古い順)、それ以外は
+  Python側で早期に`ValueError`(PG関数側でも独立に`NULL`を含め検証、
+  round 3で`p_order=NULL`が素通りするバグを修正)。keywordに含まれる
+  `%`・`_`・バックスラッシュはPG関数側でエスケープしてからパターンに
+  組み込むため、これらの文字はSQL LIKEワイルドカードとしてではなく、
+  常にkeywordそのものの文字として扱われる(round 1で発見・修正した
+  `keyword="_"`がほぼ全件にマッチしてしまうバグの根本対応でもある)
 
 `streamlit/storage.py`(commit/rollbackの責任を持つ):
 
@@ -97,65 +126,87 @@ ALTER TABLE public.records ADD COLUMN IF NOT EXISTS memo TEXT;
   「◯文字以内で、制御文字を含めずに入力してください」という具体的な案内を表示する
   (システム障害と誤解させない。監査指摘②)
 
-## ⑥実行方法・実行順序(staging) ★デプロイ順序に注意(監査指摘①)
+## ⑥実行方法・実行順序(staging) ★デプロイ順序に注意(監査round1指摘①、round3で全面訂正)
 
-**`staging`ブランチへのマージはRailway staging環境の自動デプロイを即座に
-トリガーする(第7回・第13回で確立した仕組み)。マージ後にデプロイされる
-`streamlit/app.py`は、`get_backend_name() == "postgres"`のとき無条件で
-`memo`列を参照する(記録ボタンの手前のメモ入力欄・「🔍 記録をさがす」検索欄が
-常時表示される)。したがって、`memo`列が存在しない状態でこのコードがデプロイ
-されると、記録の保存・検索が全ユーザーに対して失敗する(`psycopg.errors.
-UndefinedColumn`→`StorageUnavailableError`として捕捉されるため画面が
-クラッシュすることはないが、機能自体が使えなくなる)。**
+**★round 3で訂正(2026-09-04)**: 案A統合(PostgreSQL最小権限化との統合、
+`仕様書/PostgreSQL最小権限化・RLS設計.md`「★統合追記」参照)により、
+`streamlit/db.py`の`record_with_memo_for_tenant()`・
+`search_records_for_tenant()`は素のSQLではなく、PostgreSQL側の関数
+`public.record_with_memo_for_tenant`・`public.search_records_for_tenant`を
+呼ぶように変更されている。**この2関数を作るのはPR #30自身の
+`migrate_to_records_memo_schema.py`ではなく、PR #29の
+`migrate_to_least_privilege_schema.py`(`scripts/memo_search_functions.py`を
+関数一覧へ含める)である。** round 1で示していた「①PR #30単独の
+migrate_to_records_memo_schema.py実行→②確認→③PR #30マージ」という順序
+だけでは、この2関数が存在しないままデプロイすることになり、記録・検索が
+`psycopg.errors.UndefinedFunction`で失敗する(`StorageUnavailableError`
+として捕捉されクラッシュはしないが、機能自体が使えない点はround 1の
+指摘と同じ)。
 
-正しい順序:
+**正しい順序(PR #29の完了が前提)**:
 
 ```
-① scripts/migrate_to_records_memo_schema.py を staging DB へ実行
-   (接続先識別確認込み。実行コマンドは下記)
-② memo列が text型・NULL許容・デフォルト値なしで追加されたことを確認
-③ PR #30 を staging へマージ(Railwayが自動デプロイを開始)
-④ 自動デプロイ完了後、実機でメモ保存・検索・並び替えを確認
+① PR #29(PostgreSQL最小権限化)をstagingへマージ
+   (コードのみ。migrate_to_least_privilege_schema.pyは自動実行されない
+   ため、マージ自体はアプリの挙動を変えない)
+② staging DBの接続先・パスワード方式・バックアップを確認
+③ scripts/migrate_to_least_privilege_schema.py をstaging DBへ実行
+   (ロール作成・records.memo列・14関数(record_with_memo_for_tenant・
+   search_records_for_tenantを含む)・GRANT・RLSを一度に適用。
+   接続先識別確認込み)
+④ 既存アプリ(記録・課金・認証等、第16〜21回の機能)の正常性とDB状態を確認
+⑤ PR #30(この設計書)をstagingへマージ(Railwayが自動デプロイを開始)
+⑥ 自動デプロイ完了後、実機でメモ保存・検索・並び替え・世帯分離を確認
+⑦ 別途承認のもとで、アプリの接続ロールをapp_runtimeへ切り替え
 ```
 
-①の時点ではまだ旧い`app.py`(memo列を参照しない版)が動いているため、
-`memo`列がNULL許容で追加されるだけの本migrationは、旧アプリの動作に一切
-影響しない(存在を知らない列が増えるだけ)。この非破壊性ゆえに、
-「①migration→②確認→③デプロイ」の順序が安全に成立する。
+**`scripts/migrate_to_records_memo_schema.py`単独の位置づけ**: この
+スクリプトは(a)PR #29の`migrate_to_least_privilege_schema.py`内部から
+`ensure_records_memo_column()`として再利用される、(b)ローカル開発・
+テストでmemo列だけを試したい場合の補助ツール、の2用途に限定する。
+**このスクリプトを単独でstagingへ実行しても、2関数が無ければPR #30の
+コードは動かないため、staging適用の手順としては使わないこと**
+(`main()`によるCLI単独実行はローカル検証専用)。
 
-### ①の実行コマンド
+### ③の実行コマンド(PR #29側)
 
 ```bash
 # 以下は必ずrailway run経由(正しいプロジェクト/環境にリンクした状態)で実行し、
 # EXPECTED_TARGET_DBNAME・EXPECTED_TARGET_USER・EXPECTED_RAILWAY_PROJECT_ID・
-# EXPECTED_RAILWAY_ENVIRONMENT_ID・STAGING_DDL_EXPLICITLY_ALLOWED=true を
+# EXPECTED_RAILWAY_ENVIRONMENT_ID・STAGING_DDL_EXPLICITLY_ALLOWED=true・
+# LEAST_PRIVILEGE_APP_RUNTIME_PASSWORD・LEAST_PRIVILEGE_APP_WEBHOOK_PASSWORDを
 # 事前に設定すること(scripts/target_identity.pyが全項目の一致を必須で確認する。
 # 未設定・不一致の場合はDDLを一切実行せずに停止する)
-DATABASE_URL=<staging接続文字列> python scripts/migrate_to_records_memo_schema.py
+DATABASE_URL=<staging接続文字列> python scripts/migrate_to_least_privilege_schema.py
 ```
 
-### ②の確認クエリ
+### ④の確認クエリ(抜粋)
 
 ```sql
+-- memo列
 SELECT data_type, is_nullable, column_default
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'records' AND column_name = 'memo';
-```
+-- 期待結果: text | YES | (NULL)
 
-期待結果: `text | YES | (NULL)`。
+-- 2関数の存在・所有者・EXECUTE権限
+SELECT p.proname, p.proowner::regrole::text
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname IN ('record_with_memo_for_tenant', 'search_records_for_tenant');
+-- 期待結果: 2行とも owner = app_data_owner
+```
 
 ### ロールバック
 
-```sql
-ALTER TABLE public.records DROP COLUMN IF EXISTS memo;
-```
-
-`record_date`・`tenant_id`・他のテーブル・関数・制約には一切影響しない。
-列を削除すると保存済みのメモの内容は失われる(記録日自体は失われない)。
-**PR #30のコード(memo列を無条件で参照する`app.py`)がまだデプロイされている
-状態でDBだけ先にロールバックすると、記録ボタン自体が壊れる。DBロールバックは
-必ずアプリのデプロイロールバックと同時に行うこと**(⑥の順序を逆再生する形、
-すなわち先にアプリをロールバックしてからDBを戻す)。
+PR #29側のTier 1〜3ロールバック手順(`仕様書/PostgreSQL最小権限化・
+RLS設計.md`§17)に従う。`ALTER TABLE public.records DROP COLUMN IF EXISTS
+memo;`単独でmemo列だけを戻すことも可能だが、その場合も
+`record_with_memo_for_tenant`・`search_records_for_tenant`関数はmemo列を
+参照したまま残るため、**列だけを先に戻すと関数呼び出しが
+`UndefinedColumn`で失敗する。列のロールバックは関数の削除(PR #29の
+ロールバック手順)と同時に行うか、先にアプリ(PR #30)のデプロイを
+ロールバックしてから行うこと**。
 
 ## ⑦テスト
 
