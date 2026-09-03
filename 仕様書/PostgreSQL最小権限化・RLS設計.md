@@ -137,6 +137,92 @@ pr30-test`という一時ブランチを作成し、`feature/records-memo-search
 この実測により、監査項目⑪(PR #29適用後にPR #30のメモ機能が動かなくなる
 不整合)は**解消されたことを実機で確認済み**。
 
+### ★round 3統合監査対応(2026-09-04): Critical 1件・High 3件・Medium 1件
+
+上記の統合監査ZIP提出後、ChatGPTより「現時点ではマージ・staging適用を
+承認できない」との判定を受けた。指摘5点はいずれも妥当であり、すべて
+対応済み。
+
+**1. Critical: staging適用順序が成立しない(全面訂正)**——`streamlit/db.py`は
+`public.record_with_memo_for_tenant`・`public.search_records_for_tenant`を
+直接呼ぶが、この2関数を作るのはPR #29の`migrate_to_least_privilege_
+schema.py`であり、**PR #30自身の`migrate_to_records_memo_schema.py`は
+memo列だけを作り、関数は作らない**。旧版(round 2)で示していた
+「PR #30単独のmigration→PR #30マージ」という順序では、関数が存在せず
+`UndefinedFunction`で保存・検索が失敗する。**正しい順序へ全面訂正**:
+
+```
+① PR #29(この設計書)をstagingへマージ(コードのみ、DDLは自動実行されない)
+② staging DBの接続先・パスワード方式・バックアップを確認
+③ scripts/migrate_to_least_privilege_schema.pyをstagingで実行
+   (ロール作成・memo列・14関数・GRANT・RLSすべてを一度に適用)
+④ 既存アプリの正常性(記録・課金・認証等、第16〜21回の機能)とDB状態を確認
+⑤ PR #30をstagingへマージ(Railway自動デプロイ)
+⑥ 保存・検索・並び替え・世帯分離を実機で確認
+⑦ 別途承認のもとで、アプリの接続ロールをapp_runtimeへ切り替え
+```
+
+`scripts/migrate_to_records_memo_schema.py`単独の位置づけを明記する:
+**stagingへは単独実行しない**。用途は(a)PR #29の`migrate_to_least_
+privilege_schema.py`内部から`ensure_records_memo_column()`として再利用
+される、(b)ローカル開発・テストで最小権限化を伴わずmemo列だけを試したい
+場合の補助ツール、の2点に限定する。`main()`(CLIとしての単独実行)は
+ローカル検証専用とし、staging・productionへは実行しないことを明記する
+(仕様書/検索できるDB設計.md側にも同様の訂正を反映済み)。
+
+**2. High: DB関数自身に入力検証が無かった**——`record_with_memo_for_tenant`・
+`search_records_for_tenant`は、keywordのLIKEエスケープ・orderの検証は
+関数内で行っていたが、メモ・検索キーワードの**長さ・制御文字**の検証は
+Python側(`streamlit/storage.py`)にしか無く、`app_runtime`資格情報を
+使って関数を直接呼べば素通りしてしまっていた。「呼び出し元を信頼せず
+関数自身で安全性を保証する」という設計思想と矛盾していたため、
+`scripts/memo_search_functions.py`に以下を追加した。
+
+- `p_memo`: 200文字超・制御文字(`[[:cntrl:]]`)を拒否
+- `p_keyword`: 100文字超・制御文字を拒否
+- いずれもSQLSTATE `22023`(`invalid_parameter_value`)で送出し、呼び出し側
+  (`psycopg.errors.InvalidParameterValue`)が判別できるようにした
+- 拒否時に既存行が変更されないことを実機テストで確認
+
+**3. High: `p_order=NULL`が拒否されなかった**——`IF p_order NOT IN ('asc',
+'desc') THEN`は、SQLの3値論理により`p_order`が`NULL`の場合`NULL`(FALSEでは
+ない)と評価され、例外が発生しないまま両方の`ORDER BY`条件がNULLとなり
+順序未保証の検索が成功してしまうバグがあった(実機で再現・修正確認済み)。
+`IF p_order IS NULL OR p_order NOT IN ('asc', 'desc') THEN`へ修正した。
+
+**4. High: 設計書内に旧12関数版の実行可能コードが残っていた**——本文
+§5(関数一覧)・§6(GRANT一覧)・§16(main())・§17(ロールバック手順)は
+いずれも第13次改訂版(12関数)時点のコード例のままで、「過去版」と
+明示されずに実行可能な形で残っていた。各章の冒頭に、現在の正本
+(`scripts/*.py`)を参照するよう促す警告を追加し、§5-7(関数一覧まとめ)・
+§6-1(テーブルGRANT)は表・コードを14関数版へ更新した(本文の完全な
+書き換えは行っていない。理由: 第1〜13次の経緯そのものに監査上の価値が
+あるため、実行禁止を明示したうえで経緯記録として残す方針とした)。
+
+**5. Medium: PL/pgSQL事前検証の説明が不正確だった**——
+`scripts/memo_search_functions.py`のdocstringに「memo列が無い状態では
+CREATE FUNCTION自体が失敗する」という趣旨の記述があったが、これは誤り。
+PL/pgSQL本体は基本的な構文チェックのみでCREATEでき、埋め込まれたSQLが
+参照する列の存在は実行時まで検証されない(実機で確認: memo列が無い状態
+でも`CREATE FUNCTION`は成功し、実際に呼び出した時点で初めて
+`UndefinedColumn`になる)。docstringを訂正し、安全性の根拠は
+`ensure_records_memo_column()`の明示的な列定義検証であることを明記した。
+
+**追加した自動テスト**(`tests/test_least_privilege_schema.py`、
+`app_runtime`として完全な最小権限適用後に直接呼び出す実機テスト、
+PostgreSQL 16・18双方で確認):
+
+- メモ201文字を拒否し既存行を変更しない
+  (`test_memo_validation_rejects_invalid_input_and_preserves_existing_data`)
+- 検索語101文字・メモ/検索語の制御文字・`order=NULL`/不正値を拒否
+  (`test_search_validation_rejects_invalid_input`)
+- 同日再保存時のmemo更新(`test_memo_resave_same_date_updates_memo`)
+- `%`・`_`・`\`を文字どおり検索、asc/desc両方が機能
+  (`test_search_keyword_escapes_wildcards_and_both_orders_work`)
+
+既存202件+この設計書の20件(既存14件+第14次の2件+round 3の4件)=222件、
+PostgreSQL 16・18双方で全PASS。詳細は次の統合監査round 3 ZIPを参照。
+
 **この改訂の背景(第12次)**: 第11次改訂版の監査資料ZIPを岩瀬様が実物監査
 した結果、**「異常時(クロスDB依存・記録欠落・最終状態不一致等)でも
 処理を続行し、`[OK]`や終了コード0で成功扱いにしてしまう」という重大な
@@ -643,6 +729,17 @@ def _read_required_password(env_var_name):
 
 ## 5. 関数一覧（全12関数、完全修飾・原子的resolve_login、変更なし）
 
+> ⚠️**この章のコード例は第13次改訂版(12関数)時点のものであり、
+> 第14次(案A統合、2026-09-04、14関数)の内容を反映していません**。
+> `record_with_memo_for_tenant`・`search_records_for_tenant`の2関数が
+> `scripts/memo_search_functions.py`に追加されています。**実装・運用時は
+> この章のSQLを一切コピー&ペーストせず、必ず実際のソースファイル
+> (`scripts/least_privilege_lib.py`・`scripts/memo_search_functions.py`)を
+> 正本として参照してください。** 現在の正しい14関数の一覧は5-7章
+> (更新済み)、および冒頭の「★統合追記(案A、2026-09-04)」を参照。
+> この章自体は「なぜこの設計になったか」を理解するための経緯記録として
+> 残しています。
+
 ### 5-1. `records`関連(3関数、`web`専用)
 
 ```sql
@@ -860,7 +957,10 @@ END;
 $$;
 ```
 
-### 5-7. 関数一覧まとめ(全12関数、所有者を明記)
+### 5-7. 関数一覧まとめ(★第14次改訂で更新: 全14関数、所有者を明記)
+
+**この表は現在の正しい状態(第14次、2026-09-04、14関数)を反映しています**
+(§5本文のSQL自体は第13次<12関数>のまま、上記の警告を参照)。
 
 | # | 関数名(完全修飾) | 所有者 | 呼び出し可能ロール |
 |---|---|---|---|
@@ -876,6 +976,12 @@ $$;
 | 10 | `public.get_tenant_usage_count(uuid, text, date)` | app_data_owner | app_runtime |
 | 11 | `public.increment_tenant_usage_if_under_limit(uuid, text, date, integer)` | app_data_owner | app_runtime |
 | 12 | `public.mark_stripe_event_processed(text, text)` | app_data_owner | app_webhook |
+| 13 | `public.record_with_memo_for_tenant(uuid, date, text)`(★第14次追加) | app_data_owner | app_runtime |
+| 14 | `public.search_records_for_tenant(uuid, text, text)`(★第14次追加) | app_data_owner | app_runtime |
+
+`APP_DATA_OWNER_FUNCTION_SIGNATURES`(旧`TEN_APP_DATA_OWNER_FUNCTION_
+SIGNATURES`)は#1-4・#6-7・#9-14の12件、`ALL_FUNCTION_SIGNATURES`(旧
+`ALL_TWELVE_FUNCTION_SIGNATURES`)は全14件(`scripts/least_privilege_lib.py`)。
 
 ---
 
@@ -900,10 +1006,11 @@ GRANT USAGE ON SCHEMA public TO app_webhook;
 ロールバック時は個別に`REVOKE USAGE ON SCHEMA public FROM <role>;`で
 取り消す(17章)。
 
-### 6-1. `app_data_owner`への直接テーブルGRANT(列単位、変更なし)
+### 6-1. `app_data_owner`への直接テーブルGRANT(列単位、★第14次改訂で更新)
 
 ```sql
 GRANT SELECT, INSERT, DELETE ON public.records TO app_data_owner;
+GRANT UPDATE (memo) ON public.records TO app_data_owner;  -- ★第14次追加(下記参照)
 GRANT USAGE ON public.records_id_seq TO app_data_owner;
 GRANT SELECT (id), UPDATE (name) ON public.tenants TO app_data_owner;
 GRANT SELECT, INSERT, UPDATE ON public.tenant_subscriptions TO app_data_owner;
@@ -911,7 +1018,23 @@ GRANT SELECT, INSERT, UPDATE ON public.tenant_usage TO app_data_owner;
 GRANT INSERT ON public.processed_stripe_events TO app_data_owner;
 ```
 
+**★第14次追加の背景**: `record_with_memo_for_tenant`の
+`ON CONFLICT DO UPDATE SET memo = ...`はUPDATE権限を必要とするが、
+既存11関数はいずれも`records`へのUPDATE操作を行わなかったため、この
+GRANTは第1〜13次改訂のどの回でも必要にならず見逃されていた。
+`app_runtime`として実際に関数を呼び出す実機テストで発見・修正した
+(詳細は冒頭の「★統合追記」参照)。`tenant_id`・`record_date`列は含めず、
+`memo`列のみに限定している(列単位GRANTによる最小権限)。
+
 ### 6-2. 関数EXECUTE権限のリセットと検証（`aclexplode`のSQLを全面訂正）
+
+> ⚠️**この章のコード例(段階1・段階2とも)も第13次改訂版(12関数)時点の
+> ものです。第14次(14関数)の正しいGRANT/検証対象は`scripts/
+> least_privilege_lib.py`の`RESET_AND_GRANT_STATEMENTS`・
+> `EXPECTED_FUNCTION_GRANTS`(いずれも14件)を参照してください。**
+> `record_with_memo_for_tenant`・`search_records_for_tenant`とも、
+> 所有者`app_data_owner`・EXECUTE付与先`app_runtime`のみ(段階1の
+> パターンでいう`load_dates_for_tenant`と同じ扱い)です。
 
 **訂正の要点(3点)**: ①`aclexplode(proacl)`は複数行を返す集合関数であり、
 WHERE句で直接呼び出す構文(前版)は誤り。`CROSS JOIN LATERAL`で展開する
@@ -1606,6 +1729,14 @@ COMMIT;
 
 ## 16. migrationスクリプトの冪等性とトランザクション制御（関数所有権の検証順序を訂正）
 
+> ⚠️**この章の`main()`コード例は第13次改訂版(12関数)時点のものです。
+> 第14次(14関数)では、`grant_table_privileges()`より前に
+> `ensure_records_memo_column()`(records.memo列の用意。
+> `grant_table_privileges()`自体が`memo`列を参照するGRANT文を含むため)を
+> 追加で呼ぶ必要があります。実際の実行順序は
+> `scripts/migrate_to_least_privilege_schema.py`の`main()`を正本として
+> 参照してください(冒頭の「★統合追記」にも記載)。**
+
 **[Critical・訂正の要点]**: 前版の`main()`は
 `reset_and_grant_execute_permissions → verify_all_function_grants →
 reassign_function_owners`の順で呼んでいた。ところが6-2章の
@@ -1665,6 +1796,15 @@ def main():
 ---
 
 ## 17. ロールバック手順（監査ログの扱いを分離、開始状態を明示した3スクリプト構成へ訂正）
+
+> ⚠️**この章のロールバックスクリプトのコード例も第13次改訂版(12関数)
+> 時点のものです。第14次(14関数)では、`record_with_memo_for_tenant`・
+> `search_records_for_tenant`の所有権復帰・EXECUTE取消も対象に含める
+> 必要があり、`scripts/rollback_helpers.py`の
+> `APP_DATA_OWNER_FUNCTION_SIGNATURES`・`ALL_FUNCTION_SIGNATURES`・
+> `EXECUTE_REVOKE_TARGETS`(いずれも更新済み)には既に反映されています。
+> ロールバック作業は必ず実際のスクリプトファイルを正本として使用し、
+> この章のコードを直接実行しないでください。**
 
 **訂正の要点(第9次)**: 第8次改訂版は、12-2章で新設した
 `public.schema_migration_log`(および付随する`bigserial`のシーケンス)を

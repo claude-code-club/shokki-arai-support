@@ -127,6 +127,29 @@ def _database_url_for(dbname):
     return f"postgresql://{parts['user']}:{parts['password']}@{parts['host']}:{parts['port']}/{dbname}"
 
 
+def _execute_as_role(dbname, role, sql, params):
+    """新しい接続でSET ROLEしてから1文だけ実行し、結果行(SELECTの場合)を返す。
+
+    非LOCALのSET ROLEはトランザクション内で実行するとROLLBACKで巻き戻る
+    (PostgreSQLの仕様)ため、同じ接続でエラー後にrollbackして次のチェックを
+    続けると、意図せず接続元のロール(postgres)で実行されてしまう
+    (2026-09-04の監査で発見・記録済みの方法論上のミス、
+    仕様書のitem_methodology_note相当)。この関数は呼び出しごとに新しい接続を
+    張ることでこの問題を避ける。
+    """
+    parts = _connection_parts()
+    conn = psycopg.connect(dbname=dbname, **parts)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET ROLE {role}")
+            cur.execute(sql, params)
+            rows = cur.fetchall() if cur.description is not None else None
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
 def _identity_env(dbname, project_id="ci-test-project", environment_id="ci-test-environment"):
     return {
         "EXPECTED_TARGET_DBNAME": dbname,
@@ -403,6 +426,160 @@ class TestLeastPrivilegeMigration:
                 with pytest.raises(psycopg.errors.InsufficientPrivilege):
                     cur.execute("SELECT * FROM public.records")
             conn.rollback()
+
+    def test_memo_validation_rejects_invalid_input_and_preserves_existing_data(self, lp_db):
+        """record_with_memo_for_tenant()自身がメモの長さ・制御文字を検証し
+        (呼び出し元のPython層を信頼しない設計)、拒否時に既存行が一切
+        変更されないことをapp_runtimeとして実測する(監査指摘②)。
+        """
+        _build_full_state(lp_db)
+        parts = _connection_parts()
+        with psycopg.connect(dbname=lp_db, **parts) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.tenants (id, name) VALUES (gen_random_uuid(), 'A') RETURNING id"
+                )
+                tenant_a = cur.fetchone()[0]
+            conn.commit()
+
+        _execute_as_role(
+            lp_db, "app_runtime",
+            "SELECT public.record_with_memo_for_tenant(%s, %s, %s)",
+            (tenant_a, "2026-09-01", "既存メモ"),
+        )
+
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            _execute_as_role(
+                lp_db, "app_runtime",
+                "SELECT public.record_with_memo_for_tenant(%s, %s, %s)",
+                (tenant_a, "2026-09-01", "a" * 201),
+            )
+
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            _execute_as_role(
+                lp_db, "app_runtime",
+                "SELECT public.record_with_memo_for_tenant(%s, %s, %s)",
+                (tenant_a, "2026-09-02", "a" + chr(1) + "b"),
+            )
+
+        rows = _execute_as_role(
+            lp_db, "app_runtime",
+            "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
+            (tenant_a, None, "asc"),
+        )
+        assert [(r[0].isoformat(), r[1]) for r in rows] == [("2026-09-01", "既存メモ")]
+
+    def test_memo_resave_same_date_updates_memo(self, lp_db):
+        """同日に再度record_with_memo_for_tenant()を呼ぶと、日付は変わらず
+        memoだけが上書きされることをapp_runtimeとして実測する。
+        """
+        _build_full_state(lp_db)
+        parts = _connection_parts()
+        with psycopg.connect(dbname=lp_db, **parts) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.tenants (id, name) VALUES (gen_random_uuid(), 'A') RETURNING id"
+                )
+                tenant_a = cur.fetchone()[0]
+            conn.commit()
+
+        _execute_as_role(
+            lp_db, "app_runtime",
+            "SELECT public.record_with_memo_for_tenant(%s, %s, %s)",
+            (tenant_a, "2026-09-01", "最初のメモ"),
+        )
+        _execute_as_role(
+            lp_db, "app_runtime",
+            "SELECT public.record_with_memo_for_tenant(%s, %s, %s)",
+            (tenant_a, "2026-09-01", "書き直したメモ"),
+        )
+        rows = _execute_as_role(
+            lp_db, "app_runtime",
+            "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
+            (tenant_a, None, "asc"),
+        )
+        assert [(r[0].isoformat(), r[1]) for r in rows] == [("2026-09-01", "書き直したメモ")]
+
+    def test_search_validation_rejects_invalid_input(self, lp_db):
+        """search_records_for_tenant()自身が検索キーワードの長さ・制御文字・
+        orderのNULL/不正値を検証することをapp_runtimeとして実測する
+        (監査指摘②③)。
+        """
+        _build_full_state(lp_db)
+        parts = _connection_parts()
+        with psycopg.connect(dbname=lp_db, **parts) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.tenants (id, name) VALUES (gen_random_uuid(), 'A') RETURNING id"
+                )
+                tenant_a = cur.fetchone()[0]
+            conn.commit()
+
+        for keyword, order in [
+            ("k" * 101, "desc"),
+            ("a" + chr(2) + "b", "desc"),
+            (None, None),
+            (None, "sideways"),
+        ]:
+            with pytest.raises(psycopg.errors.InvalidParameterValue):
+                _execute_as_role(
+                    lp_db, "app_runtime",
+                    "SELECT * FROM public.search_records_for_tenant(%s, %s, %s)",
+                    (tenant_a, keyword, order),
+                )
+
+    def test_search_keyword_escapes_wildcards_and_both_orders_work(self, lp_db):
+        """%・_・バックスラッシュを含むmemoが、search_records_for_tenant()で
+        ワイルドカードとしてではなく文字どおりに検索されること、asc/desc
+        両方の並び順が機能することをapp_runtimeとして実測する。
+        """
+        _build_full_state(lp_db)
+        parts = _connection_parts()
+        with psycopg.connect(dbname=lp_db, **parts) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.tenants (id, name) VALUES (gen_random_uuid(), 'A') RETURNING id"
+                )
+                tenant_a = cur.fetchone()[0]
+            conn.commit()
+
+        for record_date, memo in [
+            ("2026-09-01", "50%オフ"),
+            ("2026-09-02", "under_score"),
+            ("2026-09-03", "no special chars"),
+        ]:
+            _execute_as_role(
+                lp_db, "app_runtime",
+                "SELECT public.record_with_memo_for_tenant(%s, %s, %s)",
+                (tenant_a, record_date, memo),
+            )
+
+        percent_rows = _execute_as_role(
+            lp_db, "app_runtime",
+            "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
+            (tenant_a, "%", "asc"),
+        )
+        assert [r[0].isoformat() for r in percent_rows] == ["2026-09-01"]
+
+        underscore_rows = _execute_as_role(
+            lp_db, "app_runtime",
+            "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
+            (tenant_a, "_", "asc"),
+        )
+        assert [r[0].isoformat() for r in underscore_rows] == ["2026-09-02"]
+
+        asc_rows = _execute_as_role(
+            lp_db, "app_runtime",
+            "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
+            (tenant_a, None, "asc"),
+        )
+        desc_rows = _execute_as_role(
+            lp_db, "app_runtime",
+            "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
+            (tenant_a, None, "desc"),
+        )
+        assert [r[0].isoformat() for r in asc_rows] == ["2026-09-01", "2026-09-02", "2026-09-03"]
+        assert [r[0].isoformat() for r in desc_rows] == ["2026-09-03", "2026-09-02", "2026-09-01"]
 
 
 @requires_db
