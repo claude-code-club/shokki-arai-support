@@ -14,8 +14,8 @@ sys.path.insert(0, str(ROOT / "streamlit"))
 import db  # noqa: E402
 import psycopg  # noqa: E402
 import storage  # noqa: E402
+import scripts.memo_search_functions as memo_search_functions_module  # noqa: E402
 import scripts.migrate_to_records_memo_schema as migrate_memo_module  # noqa: E402
-import scripts.migrate_to_tenant_schema as migrate_tenant_module  # noqa: E402
 
 SCRIPTS_DIR = ROOT / "scripts"
 
@@ -25,82 +25,81 @@ requires_db = pytest.mark.skipif(
 )
 
 
+def _setup_memo_functions_database(dbname):
+    """使い捨てデータベースへ、tenants/records(memo込み)を作り、
+    PostgreSQL側のrecord_with_memo_for_tenant()・search_records_for_tenant()
+    (scripts/memo_search_functions.py)を作成する。作成した世帯のtenant_idを返す。
+    """
+    with psycopg.connect(dbname=dbname, **_connection_parts()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(MIGRATION_BASELINE_SQL)
+            migrate_memo_module.ensure_records_memo_column(cur)
+            memo_search_functions_module.create_or_replace_memo_search_functions(cur)
+            tenant_id = uuid.uuid4()
+            cur.execute("INSERT INTO tenants (id, name) VALUES (%s, %s)", (tenant_id, "テスト世帯"))
+        conn.commit()
+    return tenant_id
+
+
 @pytest.fixture
 def memo_schema():
-    """稼働中のpublic.recordsとは隔離した専用スキーマに、tenants/records(第16回)＋
-    records.memo(第22課題)を用意する。db.py関数を直接検証する用途。
+    """record_with_memo_for_tenant()・search_records_for_tenant()(streamlit/db.py)は
+    案A対応(PR #29のPostgreSQL最小権限化との統合)により、public.records固定の
+    PostgreSQL関数(SECURITY DEFINER、SET search_path='')を呼ぶようになったため、
+    スキーマ分離(CREATE SCHEMA/SET search_path)では検証できない(呼び出し先の
+    PG関数が常にpublic.recordsを直接参照するため)。使い捨てデータベース
+    (tests/test_least_privilege_schema.pyのlp_dbと同じ設計)を使い、db.py関数を
+    直接検証する用途。(conn, tenant_id)を返す。
     """
     if not db.is_configured():
         pytest.skip("DATABASE_URLが設定されていないため、PostgreSQL連携テストをスキップします")
 
-    schema_name = f"test_memo_{uuid.uuid4().hex}"
-    conn = db.get_connection()
-    with conn.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA {schema_name}")
-        cur.execute(f"SET search_path TO {schema_name}")
-    db.ensure_schema(conn)
-    tenant_id = uuid.uuid4()
-    migrate_tenant_module.migrate_to_tenant_schema(tenant_id, conn=conn)
-    # migrate_to_records_memo_schema()はpublic.recordsを完全修飾で扱うため
-    # (監査項目③、search_path経由の想定外テーブル変更を防ぐ)、このスキーマ分離
-    # フィクスチャからは呼べない(別途memo_migration_dbフィクスチャで検証する)。
-    # ここではテスト対象スキーマへ列を追加するだけの、search_path依存の
-    # 簡易セットアップを行う。
-    with conn.cursor() as cur:
-        cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS memo TEXT")
-    conn.commit()
+    dbname = f"test_memo_{uuid.uuid4().hex[:16]}"
+    admin = _admin_connect()
+    try:
+        with admin.cursor() as cur:
+            cur.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        admin.close()
+
+    tenant_id = _setup_memo_functions_database(dbname)
+    conn = psycopg.connect(dbname=dbname, **_connection_parts())
 
     try:
         yield conn, tenant_id
     finally:
         conn.rollback()
         conn.close()
-        cleanup_conn = db.get_connection()
+        admin = _admin_connect()
         try:
-            with cleanup_conn.cursor() as cur:
-                cur.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE")
-            cleanup_conn.commit()
+            with admin.cursor() as cur:
+                cur.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
         finally:
-            cleanup_conn.close()
+            admin.close()
 
 
 @pytest.fixture
 def memo_env(monkeypatch):
-    """storage.py経由のadd_date_with_memo()/search_records()を、稼働中のpublic.records
-    とは隔離した専用スキーマ(records.memo込み)で検証する。tests/test_storage.pyの
-    tenant_envと同じ方式(db.get_connection()をスパイしてsearch_pathを固定する)。
+    """storage.py経由のadd_date_with_memo()/search_records()を、memo_schemaと同じ
+    使い捨てデータベース(PG関数込み)で検証する。tests/test_storage.pyの
+    tenant_envと同じ方式(db.get_connection()をスパイして接続先を固定する)。
     """
     if not db.is_configured():
         pytest.skip("DATABASE_URLが設定されていないため、PostgreSQL連携テストをスキップします")
 
-    good_database_url = os.environ["DATABASE_URL"]
+    dbname = f"test_memo_env_{uuid.uuid4().hex[:16]}"
+    admin = _admin_connect()
+    try:
+        with admin.cursor() as cur:
+            cur.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        admin.close()
 
-    def _connect_with_good_url():
-        return psycopg.connect(good_database_url)
-
-    schema_name = f"test_memo_env_{uuid.uuid4().hex}"
-
-    setup_conn = _connect_with_good_url()
-    with setup_conn.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA {schema_name}")
-        cur.execute(f"SET search_path TO {schema_name}")
-    db.ensure_schema(setup_conn)
-    tenant_id = uuid.uuid4()
-    migrate_tenant_module.migrate_to_tenant_schema(tenant_id, conn=setup_conn)
-    # memo_schema()と同じ理由(migrate_to_records_memo_schema()はpublic.records
-    # 完全修飾のため、スキーマ分離フィクスチャからは呼べない)で簡易セットアップ。
-    with setup_conn.cursor() as cur:
-        cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS memo TEXT")
-    setup_conn.commit()
-    setup_conn.close()
-
-    real_get_connection = db.get_connection
+    tenant_id = _setup_memo_functions_database(dbname)
+    disposable_url = _database_url_for(dbname)
 
     def patched_get_connection():
-        conn = real_get_connection()
-        with conn.cursor() as cur:
-            cur.execute(f"SET search_path TO {schema_name}")
-        return conn
+        return psycopg.connect(disposable_url)
 
     monkeypatch.setattr(db, "get_connection", patched_get_connection)
     monkeypatch.setenv(storage.STORAGE_BACKEND_ENV, "postgres")
@@ -109,13 +108,12 @@ def memo_env(monkeypatch):
     try:
         yield tenant_id
     finally:
-        cleanup_conn = _connect_with_good_url()
+        admin = _admin_connect()
         try:
-            with cleanup_conn.cursor() as cur:
-                cur.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE")
-            cleanup_conn.commit()
+            with admin.cursor() as cur:
+                cur.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
         finally:
-            cleanup_conn.close()
+            admin.close()
 
 
 def _second_tenant(conn):

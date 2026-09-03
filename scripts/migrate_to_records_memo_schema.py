@@ -57,33 +57,47 @@ def _fetch_memo_column_definition(cur):
     return {"data_type": row[0], "is_nullable": row[1], "column_default": row[2]}
 
 
-def migrate_to_records_memo_schema(conn=None):
-    """public.records.memo列を冪等に追加する(接続先識別は行わない、呼び出し元の責務)。
+def ensure_records_memo_column(cur):
+    """public.records.memo列を冪等に追加する(SQL操作のみ、commitしない)。
 
     実行前にpublic.records.memoの現在の定義を確認し、既に存在する場合は
     EXPECTED_MEMO_DEFINITIONと一致するかを検証する(型違い等の想定外の既存列を
     「変更不要」と誤認しないため)。ALTER TABLE実行後にも同じ検証を行い、
-    最終的な列定義が想定どおりであることを保証してからcommitする。
+    最終的な列定義が想定どおりであることを保証する。
+
+    commit・rollbackは呼び出し元の責務(db.pyの他の関数と同じ方針)。
+    scripts/migrate_to_least_privilege_schema.py(第22課題の2関数を関数一覧へ
+    追加する際、関数定義がmemo列を参照するため、関数作成より前にこの関数を
+    同じトランザクション内で呼ぶ)からも再利用される。
+    """
+    before = _fetch_memo_column_definition(cur)
+    if before is not None and before != EXPECTED_MEMO_DEFINITION:
+        raise UnexpectedColumnDefinitionError(
+            f"public.records.memoが既に存在しますが、想定と異なる定義です: "
+            f"実際={before} 期待={EXPECTED_MEMO_DEFINITION}。DDLは実行していません。"
+        )
+
+    cur.execute("ALTER TABLE public.records ADD COLUMN IF NOT EXISTS memo TEXT")
+
+    after = _fetch_memo_column_definition(cur)
+    if after != EXPECTED_MEMO_DEFINITION:
+        raise UnexpectedColumnDefinitionError(
+            f"ALTER TABLE後もpublic.records.memoの定義が想定と一致しません: "
+            f"実際={after} 期待={EXPECTED_MEMO_DEFINITION}"
+        )
+
+
+def migrate_to_records_memo_schema(conn=None):
+    """public.records.memo列を冪等に追加する(接続先識別は行わない、呼び出し元の責務)。
+
+    ensure_records_memo_column()を1回のトランザクションで実行し、成功時のみ
+    commitする(単独実行用。main()やテストから直接呼ぶ想定)。
     """
     owns_conn = conn is None
     conn = conn or db.get_connection()
     try:
         with conn.cursor() as cur:
-            before = _fetch_memo_column_definition(cur)
-            if before is not None and before != EXPECTED_MEMO_DEFINITION:
-                raise UnexpectedColumnDefinitionError(
-                    f"public.records.memoが既に存在しますが、想定と異なる定義です: "
-                    f"実際={before} 期待={EXPECTED_MEMO_DEFINITION}。DDLは実行していません。"
-                )
-
-            cur.execute("ALTER TABLE public.records ADD COLUMN IF NOT EXISTS memo TEXT")
-
-            after = _fetch_memo_column_definition(cur)
-            if after != EXPECTED_MEMO_DEFINITION:
-                raise UnexpectedColumnDefinitionError(
-                    f"ALTER TABLE後もpublic.records.memoの定義が想定と一致しません: "
-                    f"実際={after} 期待={EXPECTED_MEMO_DEFINITION}"
-                )
+            ensure_records_memo_column(cur)
         conn.commit()
     except (psycopg.Error, UnexpectedColumnDefinitionError):
         conn.rollback()
