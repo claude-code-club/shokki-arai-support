@@ -416,16 +416,65 @@ class TestLeastPrivilegeMigration:
     def test_app_runtime_cannot_query_records_table_directly(self, lp_db):
         """app_runtimeはrecordsテーブルへの直接GRANTを持たず、SECURITY DEFINER
         関数のEXECUTE権限だけでmemo保存・検索ができることの裏付け(素のSQLでの
-        直接アクセスは拒否されることを確認する)。
+        直接SELECT・INSERT・UPDATEがいずれも拒否されることを確認する。
+        統合監査round 3で指摘されたINSERT・UPDATEの拒否確認を追加)。
         """
         _build_full_state(lp_db)
         parts = _connection_parts()
         with psycopg.connect(dbname=lp_db, **parts) as conn:
             with conn.cursor() as cur:
-                cur.execute("SET ROLE app_runtime")
-                with pytest.raises(psycopg.errors.InsufficientPrivilege):
-                    cur.execute("SELECT * FROM public.records")
-            conn.rollback()
+                cur.execute(
+                    "INSERT INTO public.tenants (id, name) VALUES (gen_random_uuid(), 'A') RETURNING id"
+                )
+                tenant_a = cur.fetchone()[0]
+            conn.commit()
+
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            _execute_as_role(lp_db, "app_runtime", "SELECT * FROM public.records", None)
+
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            _execute_as_role(
+                lp_db, "app_runtime",
+                "INSERT INTO public.records (tenant_id, record_date) VALUES (%s, %s)",
+                (tenant_a, "2026-09-01"),
+            )
+
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            _execute_as_role(
+                lp_db, "app_runtime",
+                "UPDATE public.records SET memo = %s WHERE tenant_id = %s",
+                ("不正な直接更新", tenant_a),
+            )
+
+    def test_app_webhook_cannot_execute_memo_search_functions(self, lp_db):
+        """app_webhookはrecord_with_memo_for_tenant・search_records_for_tenantの
+        EXECUTE権限を持たない(この2関数はapp_runtime専用)ことを確認する
+        (統合監査round 3で指摘、EXPECTED_FUNCTION_GRANTSの静的定義だけでなく
+        実際にapp_webhookとして呼び出して拒否されることを実測する)。
+        """
+        _build_full_state(lp_db)
+        parts = _connection_parts()
+        with psycopg.connect(dbname=lp_db, **parts) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.tenants (id, name) VALUES (gen_random_uuid(), 'A') RETURNING id"
+                )
+                tenant_a = cur.fetchone()[0]
+            conn.commit()
+
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            _execute_as_role(
+                lp_db, "app_webhook",
+                "SELECT public.record_with_memo_for_tenant(%s, %s, %s)",
+                (tenant_a, "2026-09-01", "x"),
+            )
+
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            _execute_as_role(
+                lp_db, "app_webhook",
+                "SELECT * FROM public.search_records_for_tenant(%s, %s, %s)",
+                (tenant_a, None, "desc"),
+            )
 
     def test_memo_validation_rejects_invalid_input_and_preserves_existing_data(self, lp_db):
         """record_with_memo_for_tenant()自身がメモの長さ・制御文字を検証し
@@ -532,6 +581,8 @@ class TestLeastPrivilegeMigration:
         """%・_・バックスラッシュを含むmemoが、search_records_for_tenant()で
         ワイルドカードとしてではなく文字どおりに検索されること、asc/desc
         両方の並び順が機能することをapp_runtimeとして実測する。
+        (統合監査round 3で、docstringはバックスラッシュに言及していたが
+        実際のテスト本体には含まれていなかった不整合を指摘され、追加した)
         """
         _build_full_state(lp_db)
         parts = _connection_parts()
@@ -546,7 +597,8 @@ class TestLeastPrivilegeMigration:
         for record_date, memo in [
             ("2026-09-01", "50%オフ"),
             ("2026-09-02", "under_score"),
-            ("2026-09-03", "no special chars"),
+            ("2026-09-03", "back\\slash"),
+            ("2026-09-04", "no special chars"),
         ]:
             _execute_as_role(
                 lp_db, "app_runtime",
@@ -568,6 +620,13 @@ class TestLeastPrivilegeMigration:
         )
         assert [r[0].isoformat() for r in underscore_rows] == ["2026-09-02"]
 
+        backslash_rows = _execute_as_role(
+            lp_db, "app_runtime",
+            "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
+            (tenant_a, "\\", "asc"),
+        )
+        assert [r[0].isoformat() for r in backslash_rows] == ["2026-09-03"]
+
         asc_rows = _execute_as_role(
             lp_db, "app_runtime",
             "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
@@ -578,8 +637,12 @@ class TestLeastPrivilegeMigration:
             "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
             (tenant_a, None, "desc"),
         )
-        assert [r[0].isoformat() for r in asc_rows] == ["2026-09-01", "2026-09-02", "2026-09-03"]
-        assert [r[0].isoformat() for r in desc_rows] == ["2026-09-03", "2026-09-02", "2026-09-01"]
+        assert [r[0].isoformat() for r in asc_rows] == [
+            "2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04",
+        ]
+        assert [r[0].isoformat() for r in desc_rows] == [
+            "2026-09-04", "2026-09-03", "2026-09-02", "2026-09-01",
+        ]
 
 
 @requires_db
