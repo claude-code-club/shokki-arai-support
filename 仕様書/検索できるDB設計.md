@@ -55,6 +55,18 @@ High 3件・Medium 1件の指摘を受け、すべて対応済み。
 詳細は`仕様書/PostgreSQL最小権限化・RLS設計.md`の「★round 3統合監査対応」
 セクションも参照(項目1・4はPR #29側が主担当)。
 
+**★round 3後の追加3点対応(2026-09-04)**: round 3 ZIPへの監査は完了し、
+以下3点の追加修正のみが残った。
+
+| # | 指摘内容 | 対応 |
+|---|---|---|
+| 1 | ⑥に接続文字列を直接書く実行例`DATABASE_URL=<staging接続文字列> python ...`が残っていた | `railway run python scripts/migrate_to_least_privilege_schema.py`へ統一し、コマンド履歴・シェルログへ接続情報が平文で残る事故を防いだ |
+| 2 | PR #29側の設計書§5・§6・§16・§17に旧12関数版の実行可能コードが残っていた | PR #29側で対応(§5・§6・§16は14関数版へ更新、§17は別文書へ実行禁止の歴史的記録として分離) |
+| 3 | PG16・18の自動テストに`app_runtime`直接INSERT/UPDATE拒否・`app_webhook`による新2関数の実行拒否・バックスラッシュ文字どおり検索が不足していた | PR #29側の`tests/test_least_privilege_schema.py`へ追加、21/21 PASS |
+
+項目2・3はPR #29側が主担当。詳細は`仕様書/PostgreSQL最小権限化・RLS
+設計.md`の「★round 3後の追加3点対応」セクションを参照。
+
 ## ③DB設計
 
 ```sql
@@ -171,13 +183,15 @@ migrate_to_records_memo_schema.py実行→②確認→③PR #30マージ」と�
 ### ③の実行コマンド(PR #29側)
 
 ```bash
-# 以下は必ずrailway run経由(正しいプロジェクト/環境にリンクした状態)で実行し、
+# 必ずrailway run経由(正しいプロジェクト/環境にリンクした状態)で実行する。
+# DATABASE_URLを含む接続情報はrailwayが自動注入するため、接続文字列を
+# コマンドラインへ直書きしない(コマンド履歴・シェルログへ平文で残る事故を防ぐため)。
 # EXPECTED_TARGET_DBNAME・EXPECTED_TARGET_USER・EXPECTED_RAILWAY_PROJECT_ID・
 # EXPECTED_RAILWAY_ENVIRONMENT_ID・STAGING_DDL_EXPLICITLY_ALLOWED=true・
 # LEAST_PRIVILEGE_APP_RUNTIME_PASSWORD・LEAST_PRIVILEGE_APP_WEBHOOK_PASSWORDを
 # 事前に設定すること(scripts/target_identity.pyが全項目の一致を必須で確認する。
 # 未設定・不一致の場合はDDLを一切実行せずに停止する)
-DATABASE_URL=<staging接続文字列> python scripts/migrate_to_least_privilege_schema.py
+railway run python scripts/migrate_to_least_privilege_schema.py
 ```
 
 ### ④の確認クエリ(抜粋)
