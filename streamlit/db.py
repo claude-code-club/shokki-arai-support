@@ -176,6 +176,57 @@ def save_dates_for_tenant(dates, conn, *, tenant_id):
             )
 
 
+# --- 第22課題(検索できるDB): records.memo(SQL操作のみ、commitしない) ---
+#
+# PostgreSQL最小権限化(PR #29、仕様書/PostgreSQL最小権限化・RLS設計.md)との
+# 統合対応(案A)により、素のSQLではなくPostgreSQL側のSECURITY DEFINER関数
+# (scripts/memo_search_functions.py、public.record_with_memo_for_tenant()・
+# public.search_records_for_tenant())を呼ぶ。この2関数はpublic.recordsへの
+# 直接GRANTを持たないapp_runtimeロールでもEXECUTE権限だけで呼び出せるため、
+# 将来アプリの接続ロールがapp_runtimeへ切り替わっても(このモジュールの他の
+# 関数とは異なり)そのまま動作する。keywordのLIKEエスケープ・orderの検証は
+# PG関数側で行う(呼び出し元を信頼しない設計)。
+#
+# scripts/migrate_to_least_privilege_schema.py実行後(この2関数と
+# records.memo列が存在する)前提。
+
+
+def record_with_memo_for_tenant(record_date, memo, conn, *, tenant_id):
+    """指定tenant_idの記録日を追加し、任意のメモを添える(SQL操作のみ)。
+
+    既に同じ日付の記録が存在する場合は、日付には触れずmemoだけを上書きする
+    (insert_date_for_tenant()と同じ冪等な追加に、更新できる余地を持たせたもの)。
+    memoにNoneを渡すとNULL(メモ無し)で保存する。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT public.record_with_memo_for_tenant(%s, %s, %s)",
+            (tenant_id, record_date, memo),
+        )
+
+
+def search_records_for_tenant(conn, *, tenant_id, keyword=None, order="desc"):
+    """指定tenant_idの記録を検索する(SQL操作のみ)。
+
+    keywordを指定した場合、memoの部分一致(大文字小文字を区別しない)で絞り込む
+    (Noneまたは空文字なら絞り込まない)。keyword中の%・_・バックスラッシュは
+    ワイルドカードとしてではなく、常にkeywordそのものの文字として扱われる
+    (PG関数側でエスケープする)。orderは"desc"(新しい順、既定)または
+    "asc"(古い順)、それ以外はValueError(PG関数側でも独立に検証されるが、
+    ラウンドトリップ無しで早期に検知するためPython側でも検証する)。
+    戻り値: [{"date": "YYYY-MM-DD", "memo": str | None}, ...] をrecord_date順に並べたリスト。
+    """
+    if order not in ("asc", "desc"):
+        raise ValueError(f"orderは'asc'または'desc'で指定してください: {order!r}")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT record_date, memo FROM public.search_records_for_tenant(%s, %s, %s)",
+            (tenant_id, keyword, order),
+        )
+        return [{"date": row[0].isoformat(), "memo": row[1]} for row in cur.fetchall()]
+
+
 def compare_date_sets(json_dates, db_dates):
     """2つの日付集合(set[str])を比較し、完全一致するかと差分を返す。
 

@@ -15,15 +15,19 @@ from logic import (
 import auth
 import billing
 import metering
+import storage
 from storage import (
     RecordsFileCorruptedError,
     StorageConfigError,
     StorageUnavailableError,
     add_date,
+    add_date_with_memo,
     cancel_date,
+    get_backend_name,
     get_tenant_id,
     load_dates,
     rename_tenant,
+    search_records,
 )
 
 # 東京の座標。Open-Meteo は無料・APIキー不要の天気API。
@@ -249,12 +253,18 @@ except (StorageConfigError, StorageUnavailableError):
 today_str = today_jst().isoformat()
 
 
-def add_date_safely(record_date):
+def add_date_safely(record_date, memo=None):
     """記録保存時のStorageConfigError/StorageUnavailableErrorを、初回読み込み時と
     同じ一般向けの安全なメッセージで捕捉し、st.stop()する(内部エラーの詳細は画面に出さない)。
+
+    postgresバックエンドではmemoを添えて保存する(第22課題: 検索できるDB)。jsonバックエンドは
+    メモの概念を持たないため、従来通りadd_date()を使う(仕様書/検索できるDB設計.md参照)。
     """
     try:
-        add_date(record_date, tenant_id=TENANT_ID)
+        if get_backend_name() == "postgres":
+            add_date_with_memo(record_date, memo, tenant_id=TENANT_ID)
+        else:
+            add_date(record_date, tenant_id=TENANT_ID)
     except (StorageConfigError, StorageUnavailableError):
         st.error(
             "記録の保存中に問題が発生しました。安全のため処理を停止しました。"
@@ -294,8 +304,14 @@ if today_str in dates:
         cancel_date_safely(today_str)
         st.rerun()
 else:
+    if get_backend_name() == "postgres":
+        today_memo = st.text_input(
+            "ひとこと(任意)", key="_today_memo", max_chars=storage.MEMO_MAX_LENGTH
+        )
+    else:
+        today_memo = None
     if st.button("今日、洗いました！"):
-        add_date_safely(today_str)
+        add_date_safely(today_str, today_memo)
         st.rerun()
 
 st.divider()
@@ -363,6 +379,49 @@ else:
     st.write("　".join(recent))
 
 st.caption(f"累計記録日数: {len(dates)}日")
+
+if get_backend_name() == "postgres":
+    # --- 記録の検索・並び替え(第22課題: 検索できるDB、postgresバックエンド専用) ---
+    st.divider()
+    st.subheader("🔍 記録をさがす")
+    search_col1, search_col2 = st.columns([3, 1])
+    search_keyword = search_col1.text_input(
+        "キーワード(ひとことメモの一部)",
+        key="_search_keyword",
+        max_chars=storage.KEYWORD_MAX_LENGTH,
+    )
+    search_order_label = search_col2.selectbox(
+        "並び順", ["新しい順", "古い順"], key="_search_order"
+    )
+    search_order = "asc" if search_order_label == "古い順" else "desc"
+
+    try:
+        search_results = search_records(
+            tenant_id=TENANT_ID, keyword=search_keyword, order=search_order
+        )
+    except storage.InvalidInputError:
+        # 入力値そのものの問題(長さ・制御文字)。システム障害と誤解させないよう
+        # 専用の案内を出す(max_charsで上限自体は防げるが、制御文字等は別途ここで
+        # 拾う。ChatGPT監査2026-09-03、Highの指摘を反映)。
+        search_results = None
+        st.caption(
+            f"検索キーワードは{storage.KEYWORD_MAX_LENGTH}文字以内で、"
+            "制御文字を含めずに入力してください。"
+        )
+    except (StorageConfigError, StorageUnavailableError):
+        search_results = None
+        st.caption("検索中に問題が発生しました。しばらくしてから再度お試しください。")
+
+    if search_results is not None:
+        if not search_results:
+            st.caption(
+                "該当する記録が見つかりませんでした。"
+                if search_keyword
+                else "まだ記録がありません。"
+            )
+        else:
+            for record in search_results:
+                st.write(f"**{record['date']}** — {record['memo'] or '(メモなし)'}")
 
 if auth.is_auth_enabled() and billing.is_billing_enabled():
     # --- 30日間の詳細分析(第20回: プラン制限とメータリング、Standard限定) ---

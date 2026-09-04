@@ -72,6 +72,49 @@ def _validate_tenant_name(name):
     return stripped
 
 
+MEMO_MAX_LENGTH = 200
+KEYWORD_MAX_LENGTH = 100
+
+
+def _validate_memo(memo):
+    """記録に添えるメモの長さ・形式をサーバー側で検証する(第22課題: 検索できるDB)。
+
+    _validate_tenant_name()と同じ方針(空・制御文字・上限超過を拒否)だが、メモは
+    任意項目のため、Noneまたは空文字はエラーにせずNone(メモ無し)として扱う。
+    """
+    if memo is None:
+        return None
+    if not isinstance(memo, str):
+        raise InvalidInputError("メモは文字列で指定してください。")
+    stripped = memo.strip()
+    if not stripped:
+        return None
+    if len(stripped) > MEMO_MAX_LENGTH:
+        raise InvalidInputError(f"メモは{MEMO_MAX_LENGTH}文字以内で入力してください。")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in stripped):
+        raise InvalidInputError("メモに制御文字を含めることはできません。")
+    return stripped
+
+
+def _validate_search_keyword(keyword):
+    """検索キーワードの長さ・形式をサーバー側で検証する(第22課題: 検索できるDB)。
+
+    _validate_memo()と同じ方針。Noneまたは空文字は「絞り込まない」として扱う。
+    """
+    if keyword is None:
+        return None
+    if not isinstance(keyword, str):
+        raise InvalidInputError("検索キーワードは文字列で指定してください。")
+    stripped = keyword.strip()
+    if not stripped:
+        return None
+    if len(stripped) > KEYWORD_MAX_LENGTH:
+        raise InvalidInputError(f"検索キーワードは{KEYWORD_MAX_LENGTH}文字以内で入力してください。")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in stripped):
+        raise InvalidInputError("検索キーワードに制御文字を含めることはできません。")
+    return stripped
+
+
 def get_backend_name():
     """STORAGE_BACKENDを検証して返す。未設定時のみ'json'を返し、それ以外の不正値は
     すべてStorageConfigErrorを送出する(jsonへのフォールバックは行わない)。
@@ -232,5 +275,51 @@ def rename_tenant(name, tenant_id=None, role=None):
     except psycopg.Error as e:
         conn.rollback()
         raise StorageUnavailableError("世帯名の変更に失敗しました。") from e
+    finally:
+        conn.close()
+
+
+def add_date_with_memo(record_date, memo, tenant_id=None):
+    """1件だけ原子的に記録を追加し、任意のメモを添える(第22課題: 検索できるDB)。
+
+    add_date()のメモ対応版。メモはpostgresバックエンド専用の機能(jsonバックエンドは
+    dates(日付の集合)しか持たないため、メモの概念が無い。仕様書/検索できるDB設計.md
+    参照)。jsonバックエンドで呼び出された場合はStorageConfigErrorを送出する。
+    """
+    if get_backend_name() == "json":
+        raise StorageConfigError("jsonバックエンドではメモを保存できません(postgres限定機能)。")
+    _require_tenant_id(tenant_id)
+    validated_memo = _validate_memo(memo)
+    conn = _get_postgres_connection()
+    try:
+        db.record_with_memo_for_tenant(record_date, validated_memo, conn, tenant_id=tenant_id)
+        conn.commit()
+    except psycopg.Error as e:
+        conn.rollback()
+        raise StorageUnavailableError("PostgreSQLへの書き込みに失敗しました。") from e
+    finally:
+        conn.close()
+
+
+def search_records(tenant_id=None, keyword=None, order="desc"):
+    """記録をキーワード検索・並び替えする(第22課題: 検索できるDB、postgresバックエンド専用)。
+
+    add_date_with_memo()と同じ理由で、jsonバックエンドではStorageConfigErrorを送出する。
+    戻り値: db.search_records_for_tenant()と同じ形式のリスト。
+    """
+    if get_backend_name() == "json":
+        raise StorageConfigError("jsonバックエンドでは検索できません(postgres限定機能)。")
+    _require_tenant_id(tenant_id)
+    validated_keyword = _validate_search_keyword(keyword)
+    conn = _get_postgres_connection()
+    try:
+        result = db.search_records_for_tenant(
+            conn, tenant_id=tenant_id, keyword=validated_keyword, order=order
+        )
+        conn.commit()
+        return result
+    except psycopg.Error as e:
+        conn.rollback()
+        raise StorageUnavailableError("PostgreSQLへの検索に失敗しました。") from e
     finally:
         conn.close()
