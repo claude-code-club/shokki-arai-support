@@ -15,21 +15,70 @@ ON CONFLICT DO NOTHING(tenants挿入)、WHERE tenant_id IS NULL(backfillは
 既に移行済みの行や制約には触れない。
 
 実行方法・段階的な移行手順は仕様書/マルチテナント設計.md⑧を参照。
+
+--- 本番migration安全化(2026-09-07制定) ---
+実行前条件:
+    - recordsテーブルが既に存在すること(production_target_identity.
+      verify_expected_tables_exist()で確認)
+    - EXPECTED_TARGET_DBNAME・EXPECTED_TARGET_USER・EXPECTED_RAILWAY_
+      PROJECT_ID・EXPECTED_RAILWAY_ENVIRONMENT_ID・PRODUCTION_DDL_
+      EXPLICITLY_ALLOWED=trueがすべて設定され、実測値と一致すること
+      (production_target_identity.verify_production_migration_target())
+実行後状態:
+    - tenantsテーブルが存在し、指定したtenant_idの行が1件存在する
+    - records.tenant_idがNOT NULLで、全行に同じtenant_idが設定されている
+    - UNIQUE(tenant_id, record_date)インデックスが存在する
+再実行時の挙動:
+    - 完全に冪等。同じtenant_idで再実行しても、既に移行済みの行は
+      「WHERE tenant_id IS NULL」の対象外のため変更されない
+    - 異なるtenant_idで再実行した場合、既存行のtenant_idは上書きされない
+      (バグではなく設計: 未移行行=NULLの行だけが対象のため)
+途中失敗時の復旧:
+    - 検証(移行前後の日付集合が完全一致するか)に失敗した場合は自動で
+      rollbackされ、スキーマ変更・データ変更は一切確定しない
+    - 接続断・予期しない例外の場合もpsycopg.Error捕捉時にrollbackする
+    - 手動での復旧操作は不要(rollbackで移行前の状態に自動的に戻る)
+検証方法:
+    - 移行前後の日付集合をPythonのset比較で照合するだけでなく、両者を
+      正規化(ソート済みJSON、区切り記号固定)してSHA-256を計算し、
+      [OK]メッセージへ両方のハッシュ値を出力する。第三者(ChatGPT監査等)
+      が、実行ログのハッシュ値だけを見て「移行前後で本当にデータが
+      変わっていないか」を独立に検証できるようにするため
 """
 
+import hashlib
+import json
 import sys
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "streamlit"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import psycopg  # noqa: E402
 
 import db  # noqa: E402
+from production_target_identity import (  # noqa: E402
+    ProductionTargetMismatchError,
+    verify_expected_tables_exist,
+    verify_production_migration_target,
+)
 
 
 class MigrationVerificationError(Exception):
     """移行後の日付集合が移行前と一致しない場合に送出される。この移行による変更はrollback済み。"""
+
+
+def _canonical_date_set_hash(date_strings):
+    """日付文字列の集合を、キー順(ソート済み)・区切り記号固定のJSON文字列へ
+    正規化し、SHA-256を計算する(scripts/rollback_helpers.pyの
+    _canonical_migration_log_exportと同じ考え方)。移行前後で同じ関数を
+    使うことで、監査資料に「この2つのハッシュ値が一致した」という
+    独立に検証可能な証跡を残せる(Pythonのset比較だけでは、実行結果を
+    後から第三者が同じ手順で再現・照合できない)。
+    """
+    canonical = json.dumps(sorted(date_strings), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def migrate_to_tenant_schema(tenant_id, conn=None, tenant_name="初期世帯"):
@@ -117,9 +166,20 @@ def migrate_to_tenant_schema(tenant_id, conn=None, tenant_name="初期世帯"):
             )
             after_dates = {row[0].isoformat() for row in cur.fetchall()}
 
+        before_hash = _canonical_date_set_hash(before_dates)
+        after_hash = _canonical_date_set_hash(after_dates)
+        print(f"[検証] 移行前データのSHA-256: {before_hash}({len(before_dates)}件)")
+        print(f"[検証] 移行後データのSHA-256: {after_hash}({len(after_dates)}件)")
+
         if after_dates == before_dates:
             conn.commit()  # 10. 完全一致した場合だけ確定
-            return {"tenant_id": tenant_id, "match": True, "count": len(after_dates)}
+            return {
+                "tenant_id": tenant_id,
+                "match": True,
+                "count": len(after_dates),
+                "before_hash": before_hash,
+                "after_hash": after_hash,
+            }
         else:
             conn.rollback()  # 不一致ならこの移行による変更をすべて取り消す
             raise MigrationVerificationError(
@@ -147,18 +207,33 @@ def main(argv):
         return 1
 
     try:
-        result = migrate_to_tenant_schema(tenant_id)
-    except MigrationVerificationError as e:
+        conn = db.get_connection()
+    except db.DatabaseNotConfiguredError as e:
         print(f"[NG] {e}")
         return 1
-    except db.DatabaseNotConfiguredError as e:
+
+    try:
+        with conn.cursor() as cur:
+            verify_production_migration_target(cur)
+            # 前提: recordsテーブルが既に存在すること(tenantsは本スクリプトが新設する)。
+            verify_expected_tables_exist(cur, {"records"}, "第16回(マルチテナント設計)")
+        result = migrate_to_tenant_schema(tenant_id, conn=conn)
+    except ProductionTargetMismatchError as e:
+        print(f"[NG] {e}")
+        return 1
+    except MigrationVerificationError as e:
         print(f"[NG] {e}")
         return 1
     except psycopg.Error:
         print("[NG] PostgreSQLへの接続または操作に失敗しました。")
         return 1
+    finally:
+        conn.close()
 
-    print(f"[OK] 移行完了。tenant_id={result['tenant_id']}、記録件数={result['count']}")
+    print(
+        f"[OK] 移行完了。tenant_id={result['tenant_id']}、記録件数={result['count']}、"
+        f"移行前後のSHA-256一致確認済み(前={result['before_hash']}、後={result['after_hash']})"
+    )
     return 0
 
 

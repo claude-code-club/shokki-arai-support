@@ -7,16 +7,34 @@ migrate_to_auth_schema.pyと同じく、CREATE TABLE IF NOT EXISTSによる冪�
 全世帯へfree行を作る必要がない最小構成。仕様書/Stripe課金設計.md④参照）。
 
 実行方法・切り替え手順は仕様書/Stripe課金設計.md⑧を参照。
+
+--- 本番migration安全化(2026-09-07制定) ---
+実行前条件:
+    - tenantsテーブルが既に存在すること(第16回が先に適用済みであること)
+    - 接続先識別と本番DDL明示許可フラグがすべて一致・設定されていること
+実行後状態:
+    - tenant_subscriptionsテーブルが存在する(行は0件のまま。行が無い
+      世帯は自動的にfree扱い)
+再実行時の挙動:
+    - 完全に冪等(CREATE TABLE IF NOT EXISTSのみ)
+途中失敗時の復旧:
+    - psycopg.Error発生時はrollbackし、部分的な変更は確定しない
 """
 
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "streamlit"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import psycopg  # noqa: E402
 
 import db  # noqa: E402
+from production_target_identity import (  # noqa: E402
+    ProductionTargetMismatchError,
+    verify_expected_tables_exist,
+    verify_production_migration_target,
+)
 
 
 def migrate_to_billing_schema(conn=None):
@@ -55,13 +73,25 @@ def main(argv):
         print("使い方: python scripts/migrate_to_billing_schema.py")
         return 1
     try:
-        migrate_to_billing_schema()
+        conn = db.get_connection()
     except db.DatabaseNotConfiguredError as e:
+        print(f"[NG] {e}")
+        return 1
+
+    try:
+        with conn.cursor() as cur:
+            verify_production_migration_target(cur)
+            verify_expected_tables_exist(cur, {"tenants"}, "第18回(Stripeサブスク決済)")
+        migrate_to_billing_schema(conn=conn)
+    except ProductionTargetMismatchError as e:
         print(f"[NG] {e}")
         return 1
     except psycopg.Error:
         print("[NG] PostgreSQLへの接続または操作に失敗しました。")
         return 1
+    finally:
+        conn.close()
+
     print("[OK] tenant_subscriptionsテーブルを作成しました(既に存在する場合は変更なし)")
     return 0
 
