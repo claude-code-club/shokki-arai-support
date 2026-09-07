@@ -234,3 +234,31 @@ def rename_tenant(name, tenant_id=None, role=None):
         raise StorageUnavailableError("世帯名の変更に失敗しました。") from e
     finally:
         conn.close()
+
+
+def apply_tenant_rename(new_name, tenant_id, role):
+    """世帯名変更操作をUI非依存の結果へ変換する(第25課題: 落ちない化)。
+
+    rename_tenant()を呼び出し、画面(app.py)がst.error/st.successへそのまま
+    渡せる結果を返す。Streamlitに依存しないため、実際のPostgreSQL
+    バックエンドに対してこの関数自体をテストできる(tests/参照)。
+
+    戻り値: (成功したか, 画面に表示するメッセージ, 呼び出し元がst.stop()すべきか)
+    """
+    try:
+        rename_tenant(new_name, tenant_id=tenant_id, role=role)
+    except InvalidInputError as e:
+        # 空欄・上限超過・制御文字など、入力内容そのものが原因の場合は、
+        # 検証エラーの具体的な理由をそのまま返す。呼び出し元はst.stop()しない
+        # 想定(入力を直せばその場でもう一度試せるようにするため)。
+        return False, str(e), False
+    except (StorageConfigError, StorageUnavailableError):
+        # DB接続断・admin権限なし等、入力内容以外が原因の場合は内部情報を
+        # 一切返さず、既存のadd_date_safely等と同じ安全側の汎用メッセージにする。
+        return (
+            False,
+            "世帯名の変更中に問題が発生しました。安全のため処理を停止しました。"
+            "しばらくしてから再度お試しいただくか、管理者に連絡してください。",
+            True,
+        )
+    return True, "世帯名を変更しました。", False
