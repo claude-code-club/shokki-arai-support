@@ -16,6 +16,8 @@ import auth
 import billing
 import metering
 from storage import (
+    TENANT_NAME_MAX_LENGTH,
+    InvalidInputError,
     RecordsFileCorruptedError,
     StorageConfigError,
     StorageUnavailableError,
@@ -437,16 +439,22 @@ if auth.is_auth_enabled() and billing.is_billing_enabled():
 if auth.is_auth_enabled() and USER_ROLE == "admin":
     st.divider()
     st.subheader("世帯の設定(admin専用)")
-    new_name = st.text_input("世帯名")
-    if st.button("世帯名を変更する") and new_name:
+    new_name = st.text_input("世帯名", max_chars=TENANT_NAME_MAX_LENGTH)
+    if st.button("世帯名を変更する"):
         try:
             rename_tenant(new_name, tenant_id=TENANT_ID, role=USER_ROLE)
+        except InvalidInputError as e:
+            # 空欄・上限超過・制御文字など、入力内容そのものが原因の場合は、
+            # 検証エラーの具体的な理由をそのまま表示する(第25課題: 落ちない化)。
+            # st.stop()はしない — 入力を直せばその場でもう一度試せるようにするため。
+            st.error(str(e))
         except (StorageConfigError, StorageUnavailableError):
             st.error(
                 "世帯名の変更中に問題が発生しました。安全のため処理を停止しました。"
                 "しばらくしてから再度お試しいただくか、管理者に連絡してください。"
             )
             st.stop()
-        st.success("世帯名を変更しました。")
+        else:
+            st.success("世帯名を変更しました。")
 
 st.caption("v1.1")
